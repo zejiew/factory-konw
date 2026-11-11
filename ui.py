@@ -146,12 +146,23 @@ class App(tk.Tk):
         top.pack(fill="x", side="top")
         top.pack_propagate(False)
 
-        tk.Label(top, text=APP_TITLE, font=self.opt["font_h1"],
-                 bg=C_CARD, fg=C_TEXT).pack(side="left", padx=20)
+        # 标题 + 署名 竖排，让 "by zejiew" 贴着标题右下角，不跟右侧按钮抢位置
+        brand = tk.Frame(top, bg=C_CARD)
+        brand.pack(side="left", padx=20)
+
+        tk.Label(brand, text=APP_TITLE, font=self.opt["font_h1"],
+                 bg=C_CARD, fg=C_TEXT).pack(anchor="w")
+
+        sign = tk.Frame(brand, bg=C_CARD)
+        sign.pack(anchor="e", pady=(0, 2))
+        tk.Label(sign, text="by ", font=(self.font_name, 8),
+                 bg=C_CARD, fg="#c3cbd6").pack(side="left")
+        tk.Label(sign, text="zejiew", font=(self.font_name, 8),
+                 bg=C_CARD, fg="#9aa4b1").pack(side="left")
 
         self.lbl_stats = tk.Label(top, text="", font=(self.font_name, 9),
                                   bg=C_CARD, fg=C_MUTED)
-        self.lbl_stats.pack(side="left", padx=10)
+        self.lbl_stats.pack(side="left", padx=14)
 
         right = tk.Frame(top, bg=C_CARD)
         right.pack(side="right", padx=14)
