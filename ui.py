@@ -34,6 +34,32 @@ C_OUT = "#d93025"
 C_LINE = "#d9dee5"
 
 
+def icon_candidates():
+    """
+    找 app.ico 的候选路径。
+
+    三种运行方式都要照顾到：
+      1. python ui.py          → 源码目录
+      2. PyInstaller 文件夹版   → _MEIPASS（_internal）里
+      3. PyInstaller 单文件版   → 同样在 _MEIPASS 里，但 exe 旁边也可能放了一份
+    """
+    out = []
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        out.append(os.path.join(base, "app.ico"))
+    out.append(os.path.join(base_dir(), "app.ico"))
+    if getattr(sys, "frozen", False):
+        out.append(os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "app.ico"))
+    return out
+
+
+def base_dir():
+    """程序所在目录（打包后是 exe 所在目录）。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def _human_size(n):
     try:
         n = float(n)
@@ -69,6 +95,9 @@ class App(tk.Tk):
         self.minsize(980, 620)
         self.configure(bg=C_BG)
 
+        # 标题栏左上角那个图标：不设就是 Tk 默认的羽毛
+        self._apply_icon()
+
         # 下拉框映射表：显示文字 -> 数据库 id（页面构建时就要用，先建好）
         self.mat_map = {}
         self.fac_map = {}
@@ -83,6 +112,21 @@ class App(tk.Tk):
         self.refresh_all()
         self.after(200, self._first_run_hint)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _apply_icon(self):
+        """
+        把窗口图标换成 app.ico。
+
+        打包成 exe 后 app.ico 会被 PyInstaller 塞进 _MEIPASS，不在 exe 旁边，
+        所以先找资源目录，再退回源码目录；两处都没有就安静跳过（不影响启动）。
+        """
+        for p in icon_candidates():
+            try:
+                if os.path.exists(p):
+                    self.iconbitmap(default=p)
+                    return
+            except Exception:
+                continue
 
     # ============================================================ 样式
 
