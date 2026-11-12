@@ -102,6 +102,43 @@ step("流水-筛选代工厂", lambda: (
 step("材料字典", lambda: print("       材料行:", len(app.tv_mat.get_children())))
 step("代工厂页", lambda: print("       工厂行:", len(app.tv_fac.get_children())))
 
+# --- 删除代工厂（软删除，可恢复）
+def delete_empty_factory():
+    f3 = s.add_factory("空厂C")
+    app.refresh_all()
+    before = len(app.tv_fac.get_children())
+    app.tv_fac.selection_set(str(f3))
+    app.delete_factory_sel()
+    after = len(app.tv_fac.get_children())
+    print("       删除前 %d 行 → 删除后 %d 行" % (before, after))
+    assert after == before - 1, "删除后应少一行"
+    # 勾「显示已删除」能看到它，且状态是「已删除」
+    app.v_fac_show_deleted.set(True)
+    app.refresh_factories()
+    vals = app.tv_fac.item(str(f3), "values")
+    print("       显示已删除后状态:", vals[-1])
+    assert vals[-1] == "已删除", "状态应显示已删除"
+    # 恢复
+    app.tv_fac.selection_set(str(f3))
+    app.restore_factory_sel()
+    assert s.factory_by_id(f3)["deleted"] == 0, "恢复后 deleted=0"
+    app.v_fac_show_deleted.set(False)
+    app.refresh_all()
+    assert str(f3) in app.tv_fac.get_children(), "恢复后重新出现在列表"
+
+
+def delete_factory_with_records_blocked():
+    """有有效流水的厂：删除会被拦，厂和数据都不动。"""
+    app.refresh_all()
+    app.tv_fac.selection_set(str(f1))
+    app.delete_factory_sel()          # askyesno 被静音成 True，靠数据层拒绝
+    assert s.factory_by_id(f1)["deleted"] == 0, "有流水的厂删不掉"
+    assert s.balance(mid, f1) > 0, "数据没被动过"
+
+
+step("删除空厂并恢复", delete_empty_factory)
+step("有流水的厂拒绝删除", delete_factory_with_records_blocked)
+
 step("停用材料", lambda: (s.set_material_active(mid_b, False), app.refresh_all(),
                        print("       下拉可选:", len(app.mat_map))))
 step("恢复材料", lambda: (s.set_material_active(mid_b, True), app.refresh_all()))

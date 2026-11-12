@@ -503,10 +503,17 @@ class Store(object):
     # ---------------- 代工厂
 
     @_locked
-    def list_factories(self, active_only=True):
+    def list_factories(self, active_only=True, include_deleted=False):
+        """
+        active_only=True  只要在用的（下拉框用这个）
+        active_only=False 在用的 + 已停用
+        include_deleted   连「已删除」的也列出来（只有代工厂页勾了「显示已删除」时才要）
+        """
         sql = "SELECT * FROM factories WHERE 1=1"
         if active_only:
             sql += " AND active=1"
+        if not include_deleted:
+            sql += " AND deleted=0"
         sql += " ORDER BY name COLLATE NOCASE"
         return [dict(r) for r in self.conn.execute(sql).fetchall()]
 
@@ -534,10 +541,13 @@ class Store(object):
             raise ValueError("代工厂名称不能为空")
         row = self.conn.execute("SELECT * FROM factories WHERE name=?", (name,)).fetchone()
         if row:
-            if row["active"]:
+            if row["active"] and not row["deleted"]:
                 raise ValueError("代工厂「%s」已存在" % name)
-            self.conn.execute("UPDATE factories SET active=1, updated_at=? WHERE id=?",
-                              (now_full(), row["id"]))
+            # 停用或已删除的同名厂：直接复活，不新建一条（否则名称唯一索引会撞车）
+            self.conn.execute(
+                "UPDATE factories SET active=1, deleted=0, contact=?, note=?, updated_at=?"
+                " WHERE id=?",
+                (contact or row["contact"], note or row["note"], now_full(), row["id"]))
             self.conn.commit()
             self.mark_dirty("factory_restore", row["id"])
             return row["id"]
@@ -579,9 +589,72 @@ class Store(object):
 
     @_locked
     def factory_record_count(self, fid):
+        """这个厂名下有几条流水（含已作废/已删除，用来判断能不能真删）。"""
         return self.conn.execute(
             "SELECT COUNT(*) n FROM records WHERE factory_id=?", (fid,)
         ).fetchone()["n"]
+
+    @_locked
+    def factory_live_record_count(self, fid):
+        """这个厂名下有几条「还在用」的流水（未作废且未删除）——真删前必须先清掉。"""
+        return self.conn.execute(
+            "SELECT COUNT(*) n FROM records WHERE factory_id=? AND voided=0 AND deleted=0",
+            (fid,)
+        ).fetchone()["n"]
+
+    @_locked
+    def delete_factory(self, fid):
+        """
+        删除代工厂（软删除，可在「显示已删除」里恢复）。
+
+        和「停用」的区别：
+          停用 active=0  → 只是从下拉框隐藏，列表里还在，随时能启用
+          删除 deleted=1 → 从代工厂列表拿走，只能在「显示已删除」里看到
+
+        为什么仍然不真删：多端同步靠 uid 认人。真删掉的话，另一端下次同步
+        不知道这条被删了，会把它当新数据导回来，形成删不掉的幽灵厂。
+        所以打标记，deleted=1 跟着同步包一起走。
+
+        安全闸：名下还有「有效流水」的厂不允许删除——
+        否则那些流水的 factory_id 指向一个已删的厂，总览里会冒出「(已删除)」，
+        账就说不清是谁家的了。先作废/删除那些流水，或者干脆用「停用」。
+        """
+        f = self.factory_by_id(fid)
+        if not f:
+            return 0
+        if int(f.get("deleted") or 0):
+            return 0
+        live = self.factory_live_record_count(fid)
+        if live > 0:
+            raise ValueError(
+                "「%s」名下还有 %d 条有效记录，删掉厂会让这些账无所属。\n\n"
+                "请先在「流水明细」里把这些记录作废或删除，再来删厂；\n"
+                "如果只是不想在下拉框里看到它，用「停用」就够了。"
+                % (f["name"], live))
+        self.conn.execute(
+            "UPDATE factories SET deleted=1, active=0, updated_at=? WHERE id=?",
+            (now_full(), fid))
+        self.conn.commit()
+        self.mark_dirty("factory_delete", f["name"])
+        return 1
+
+    @_locked
+    def restore_factory(self, fid):
+        """从「已删除」里恢复一个代工厂。恢复后它是「在用」状态。"""
+        cur = self.conn.execute(
+            "UPDATE factories SET deleted=0, active=1, updated_at=?"
+            " WHERE id=? AND deleted=1", (now_full(), fid))
+        self.conn.commit()
+        if cur.rowcount:
+            self.mark_dirty("factory_undelete", fid)
+            return 1
+        return 0
+
+    @_locked
+    def deleted_factory_count(self):
+        row = self.conn.execute(
+            "SELECT COUNT(*) n FROM factories WHERE deleted=1").fetchone()
+        return row["n"] if row else 0
 
     # ---------------- 流水
 
@@ -643,6 +716,13 @@ class Store(object):
         mat = self.material_by_id(material_id)
         if mat is not None and not int(mat.get("quality_split") or 0):
             quality = ""
+
+        # 已删除的代工厂不该再记账（下拉框里本来也选不到，这里是兜底：
+        # 界面开着的时候这个厂被删了，或者同步过来的数据里带着它）
+        fac = self.factory_by_id(factory_id)
+        if fac is not None and int(fac.get("deleted") or 0):
+            raise ValueError("代工厂「%s」已经删除，不能再记账。请换一个厂。"
+                             % fac["name"])
 
         qty = round(float(qty or 0), 4)
 

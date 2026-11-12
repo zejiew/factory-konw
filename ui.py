@@ -1025,6 +1025,15 @@ class App(tk.Tk):
                    command=lambda: self.factory_dialog(None)).pack(side="left")
         ttk.Button(bar, text="修改", command=self.edit_factory_sel).pack(side="left", padx=6)
         ttk.Button(bar, text="停用 / 启用", command=self.toggle_factory_sel).pack(side="left", padx=6)
+        ttk.Button(bar, text="删除", style="Danger.TButton",
+                   command=self.delete_factory_sel).pack(side="left", padx=(14, 6))
+        ttk.Button(bar, text="恢复选中", command=self.restore_factory_sel).pack(side="left")
+
+        self.v_fac_show_deleted = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="显示已删除", variable=self.v_fac_show_deleted,
+                        command=self.refresh_factories).pack(side="right")
+        tk.Label(bar, text="删除后不再出现；停用只是隐藏，随时能启用",
+                 bg=C_BG, fg=C_MUTED, font=(self.font_name, 9)).pack(side="right", padx=12)
 
         wrap = tk.Frame(root, bg=C_CARD, highlightbackground=C_LINE, highlightthickness=1)
         wrap.pack(fill="both", expand=True)
@@ -1041,29 +1050,35 @@ class App(tk.Tk):
         self.tv_fac.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
         self.tv_fac.tag_configure("off", foreground="#a3a8b8")
+        self.tv_fac.tag_configure("del", foreground="#c0c6d0")
         self.tv_fac.bind("<Double-1>", lambda _e: self.edit_factory_sel())
 
     def refresh_factories(self):
         tv = self.tv_fac
         tv.delete(*tv.get_children())
-        rows = self.store.list_factories(active_only=False)
+        show_del = bool(self.v_fac_show_deleted.get())
+        rows = self.store.list_factories(active_only=False, include_deleted=show_del)
         self.fac_map = {}
         self.store_fac_map = {"全部": None}
         for r in rows:
-            if r["active"]:
+            gone = bool(int(r.get("deleted") or 0))
+            if r["active"] and not gone:
                 self.fac_map[r["name"]] = r["id"]
                 self.store_fac_map[r["name"]] = r["id"]
             kinds = self.conn_kinds(r["id"])
+            state = "已删除" if gone else ("在用" if r["active"] else "已停用")
+            tag = ("del",) if gone else (() if r["active"] else ("off",))
             tv.insert("", "end", iid=str(r["id"]),
-                      values=(r["name"], r["contact"], kinds, fmt_qty(self.store.factory_total(r["id"])),
-                              r["note"], "在用" if r["active"] else "已停用"),
-                      tags=() if r["active"] else ("off",))
+                      values=(r["name"], r["contact"], kinds,
+                              fmt_qty(self.store.factory_total(r["id"])),
+                              r["note"], state),
+                      tags=tag)
         self._sync_combos()
 
     def conn_kinds(self, fid):
         row = self.store.conn.execute(
-            "SELECT COUNT(DISTINCT material_id) n FROM records WHERE factory_id=? AND voided=0",
-            (fid,)).fetchone()
+            "SELECT COUNT(DISTINCT material_id) n FROM records WHERE factory_id=? AND voided=0"
+            " AND deleted=0", (fid,)).fetchone()
         return row["n"] if row else 0
 
     def edit_factory_sel(self):
@@ -1071,7 +1086,17 @@ class App(tk.Tk):
         if not sel:
             messagebox.showinfo(APP_TITLE, "先选一行代工厂", parent=self)
             return
-        self.factory_dialog(int(sel[0]))
+        fid = int(sel[0])
+        f = self.store.factory_by_id(fid)
+        # 已删除的厂不该进编辑窗（改完也不会回到列表），直接引导去恢复
+        if f and int(f.get("deleted") or 0):
+            if messagebox.askyesno(APP_TITLE,
+                                   "「%s」已经删除了，不能改。\n\n现在把它恢复回来吗？"
+                                   % f["name"], parent=self):
+                self.tv_fac.selection_set(str(fid))
+                self.restore_factory_sel()
+            return
+        self.factory_dialog(fid)
 
     def toggle_factory_sel(self):
         sel = self.tv_fac.selection()
@@ -1080,6 +1105,11 @@ class App(tk.Tk):
             return
         fid = int(sel[0])
         f = self.store.factory_by_id(fid)
+        if int(f.get("deleted") or 0):
+            messagebox.showinfo(APP_TITLE,
+                                "「%s」已经删除了。\n要重新用它，点「恢复选中」。" % f["name"],
+                                parent=self)
+            return
         if f["active"] and self.store.factory_record_count(fid) > 0:
             if not messagebox.askyesno(APP_TITLE,
                                        "「%s」有 %d 条记录，停用后记录仍保留。确定停用？"
@@ -1087,6 +1117,97 @@ class App(tk.Tk):
                 return
         self.store.set_factory_active(fid, not f["active"])
         self.refresh_all()
+
+    def delete_factory_sel(self):
+        """
+        删除代工厂（软删除，可恢复）。
+
+        和「停用」的区别要跟用户讲清楚：
+          停用 = 从下拉框藏起来，列表里还在，随时能启用
+          删除 = 从代工厂列表拿走，只能在「显示已删除」里看到
+
+        名下还有有效流水的厂不允许删——那些账会变成「无所属」。
+        """
+        sel = self.tv_fac.selection()
+        if not sel:
+            messagebox.showinfo(APP_TITLE, "先选中要删除的代工厂", parent=self)
+            return
+
+        names, blocked = [], []
+        for iid in sel:
+            fid = int(iid)
+            f = self.store.factory_by_id(fid)
+            if not f:
+                continue
+            if int(f.get("deleted") or 0):
+                continue
+            live = self.store.factory_live_record_count(fid)
+            if live > 0:
+                blocked.append((f["name"], live, self.store.factory_total(fid)))
+            else:
+                names.append(f["name"])
+
+        if blocked:
+            detail = "\n".join("  %s —— 还有 %d 条有效记录（结存 %s）"
+                               % (n, c, fmt_qty(q)) for n, c, q in blocked)
+            msg = ("以下代工厂名下还有有效流水，不能直接删除：\n\n%s\n\n"
+                   "删掉厂，这些账就无所属了。可以：\n"
+                   "  · 在「流水明细」里把那些记录作废或删除，再来删厂\n"
+                   "  · 或者用「停用 / 启用」——它只是从下拉框藏起来，账一分不少\n\n"
+                   "仍然继续删除其余可以删的吗？" % detail)
+            if not messagebox.askyesno(APP_TITLE, msg, parent=self):
+                return
+
+        if not names:
+            if not blocked:
+                messagebox.showinfo(APP_TITLE, "选中的都是已删除的代工厂，不用再删。", parent=self)
+            return
+
+        if not messagebox.askyesno(
+                APP_TITLE,
+                "确定删除以下代工厂？\n\n  %s\n\n"
+                "删除后它们不再出现在下拉框和列表里，\n"
+                "数据没有真删，勾上「显示已删除」可以点「恢复选中」找回来。"
+                % "\n  ".join(names), parent=self):
+            return
+
+        n = 0
+        skipped = []
+        for iid in sel:
+            fid = int(iid)
+            f = self.store.factory_by_id(fid)
+            if not f or int(f.get("deleted") or 0):
+                continue
+            try:
+                n += self.store.delete_factory(fid)
+            except ValueError as ex:
+                # 数据层还有一道闸（判断之后、删除之前又记了账这种极端情况），
+                # 不弹一个就把整个操作打断，收集起来最后统一说。
+                skipped.append(str(ex).split("\n")[0])
+        if skipped:
+            messagebox.showwarning(APP_TITLE, "以下代工厂没能删除：\n\n  "
+                                   + "\n  ".join(skipped), parent=self)
+        self.set_status("已删除 %d 个代工厂（勾「显示已删除」可恢复）" % n, C_OUT)
+        self.refresh_all()
+        self.auto_cloud_after_save()
+
+    def restore_factory_sel(self):
+        """把「已删除」的代工厂恢复回来。"""
+        sel = self.tv_fac.selection()
+        if not sel:
+            messagebox.showinfo(APP_TITLE, "先选中要恢复的代工厂", parent=self)
+            return
+        n = 0
+        for iid in sel:
+            n += self.store.restore_factory(int(iid))
+        if not n:
+            messagebox.showinfo(APP_TITLE,
+                                "选中的代工厂不在「已删除」状态，不用恢复。\n"
+                                "（停用的用「停用 / 启用」按钮）", parent=self)
+            return
+        self.set_status("已恢复 %d 个代工厂" % n, C_IN)
+        self.refresh_all()
+        self.auto_cloud_after_save()
 
     def factory_dialog(self, fid):
         FactoryDialog(self, self.store, fid, on_done=self.refresh_all)
