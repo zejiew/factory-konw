@@ -12,6 +12,7 @@
 import os
 import sys
 import csv
+import uuid
 import shutil
 import sqlite3
 import datetime
@@ -85,6 +86,17 @@ def now_str():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
+def now_full():
+    """
+    带秒的时间戳，专供 updated_at 用。
+
+    为什么不能复用 now_str：它只到分钟。同一分钟内连记两笔账，
+    updated_at 会完全相同，增量同步用 ">" 比较时就会把旧的一起带上，
+    多端合并时也判断不出「谁后改的」。
+    """
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def today_str():
     return datetime.date.today().strftime("%Y-%m-%d")
 
@@ -120,6 +132,9 @@ class Store(object):
                 note       TEXT    NOT NULL DEFAULT '',
                 active     INTEGER NOT NULL DEFAULT 1,
                 quality_split INTEGER NOT NULL DEFAULT 0,
+                uid        TEXT    NOT NULL DEFAULT '',
+                updated_at TEXT    NOT NULL DEFAULT '',
+                deleted    INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT    NOT NULL
             );
             CREATE UNIQUE INDEX IF NOT EXISTS ux_material ON materials(name, spec);
@@ -130,6 +145,9 @@ class Store(object):
                 contact    TEXT    NOT NULL DEFAULT '',
                 note       TEXT    NOT NULL DEFAULT '',
                 active     INTEGER NOT NULL DEFAULT 1,
+                uid        TEXT    NOT NULL DEFAULT '',
+                updated_at TEXT    NOT NULL DEFAULT '',
+                deleted    INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT    NOT NULL
             );
 
@@ -145,6 +163,9 @@ class Store(object):
                 note        TEXT    NOT NULL DEFAULT '',
                 quality     TEXT    NOT NULL DEFAULT '',
                 voided      INTEGER NOT NULL DEFAULT 0,
+                uid         TEXT    NOT NULL DEFAULT '',
+                updated_at  TEXT    NOT NULL DEFAULT '',
+                deleted     INTEGER NOT NULL DEFAULT 0,
                 created_at  TEXT    NOT NULL
             );
             CREATE INDEX IF NOT EXISTS ix_rec_mat ON records(material_id);
@@ -176,6 +197,9 @@ class Store(object):
         加过的列：
           materials.quality_split  该材料是否启用良品/不良品区分
           records.quality          这一笔流水算良品还是不良品
+
+        多端同步相关（uid / updated_at / deleted）：
+          三张业务表都要，见 _migrate_sync()
         """
         c = self.conn
 
@@ -189,6 +213,68 @@ class Store(object):
         if "quality" not in cols("records"):
             c.execute("ALTER TABLE records ADD COLUMN quality TEXT NOT NULL DEFAULT ''")
             c.commit()
+
+        self._migrate_sync()
+
+    def _migrate_sync(self):
+        """
+        多端同步需要的三样东西，加到 materials / factories / records：
+
+          uid         全局唯一 id（UUID）。本地 id 在不同电脑上会重复，
+                      合并时必须靠它认「这是不是同一条」。
+          updated_at  最后一次修改时间。两端同时改一条时，用它判断谁更新。
+          deleted     软删除标记。真删掉的话，另一端同步时没法知道「这条被删了」，
+                      会把它当成新数据又导回来。所以只打标记不真删。
+
+        老数据补 uid：用 表名+id 生成确定性的 uuid，保证同一行每次算出来一样。
+        """
+        import uuid as _uuid
+
+        c = self.conn
+
+        def cols(table):
+            return {r[1] for r in c.execute("PRAGMA table_info(%s)" % table)}
+
+        for table in ("materials", "factories", "records"):
+            have = cols(table)
+            changed = False
+            if "uid" not in have:
+                c.execute("ALTER TABLE %s ADD COLUMN uid TEXT NOT NULL DEFAULT ''" % table)
+                changed = True
+            if "updated_at" not in have:
+                c.execute("ALTER TABLE %s ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''" % table)
+                changed = True
+            if "deleted" not in have:
+                c.execute("ALTER TABLE %s ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0" % table)
+                changed = True
+            if changed:
+                c.commit()
+
+            # 关键顺序：先把空 uid 全部补上，再建唯一索引。
+            # 反过来会直接失败——所有老数据 uid 都是 ''，加唯一索引时互相冲突。
+            rows = c.execute("SELECT id FROM %s WHERE uid=''" % table).fetchall()
+            for r in rows:
+                det = _uuid.uuid5(_uuid.NAMESPACE_URL, "invtool/%s/%s" % (table, r[0]))
+                c.execute("UPDATE %s SET uid=?, updated_at=COALESCE(NULLIF(updated_at,''), ?)"
+                          " WHERE id=?" % table, (str(det), now_full(), r[0]))
+            if rows:
+                c.commit()
+
+            # 兜底：updated_at 还空着的补上
+            c.execute("UPDATE %s SET updated_at=? WHERE updated_at=''" % table, (now_full(),))
+            c.commit()
+
+            # 内容补齐之后才建唯一索引
+            try:
+                c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_%s_uid ON %s(uid)"
+                          % (table, table))
+                c.commit()
+            except sqlite3.IntegrityError:
+                # 万一历史数据里真有重复 uid（手工改过库），退化成普通索引，
+                # 同步仍能工作（按 uid 查第一条），只是不再强制唯一。
+                c.rollback()
+                c.execute("CREATE INDEX IF NOT EXISTS ix_%s_uid ON %s(uid)" % (table, table))
+                c.commit()
 
     # ---------------- 设置项
 
@@ -258,15 +344,16 @@ class Store(object):
         if exist:
             if exist["active"]:
                 raise ValueError("材料「%s」已存在" % material_display(dict(exist)))
-            self.conn.execute("UPDATE materials SET active=1 WHERE id=?", (exist["id"],))
+            self.conn.execute("UPDATE materials SET active=1, updated_at=? WHERE id=?",
+                              (now_full(), exist["id"]))
             self.conn.commit()
             self.mark_dirty("material_restore", exist["id"])
             return exist["id"]
         cur = self.conn.execute(
             "INSERT INTO materials(name, spec, unit, category, min_qty, note, active,"
-            " quality_split, created_at) VALUES(?,?,?,?,?,?,1,?,?)",
+            " quality_split, uid, updated_at, created_at) VALUES(?,?,?,?,?,?,1,?,?,?,?)",
             (name, spec, unit or "", category or "", float(min_qty or 0), note or "",
-             1 if quality_split else 0, now_str()),
+             1 if quality_split else 0, str(uuid.uuid4()), now_full(), now_str()),
         )
         self.conn.commit()
         self.mark_dirty("material_add", name)
@@ -282,6 +369,8 @@ class Store(object):
                 args.append(kw[f])
         if not sets:
             return
+        sets.append("updated_at=?")
+        args.append(now_full())
         args.append(mid)
         try:
             self.conn.execute("UPDATE materials SET %s WHERE id=?" % ", ".join(sets), args)
@@ -293,7 +382,8 @@ class Store(object):
     @_locked
     def set_material_active(self, mid, active):
         """停用/启用。停用后不出现在下拉框里，但历史流水和结存照样保留。"""
-        self.conn.execute("UPDATE materials SET active=? WHERE id=?", (1 if active else 0, mid))
+        self.conn.execute("UPDATE materials SET active=?, updated_at=? WHERE id=?",
+                          (1 if active else 0, now_full(), mid))
         self.conn.commit()
         self.mark_dirty("material_active", "%s -> %s" % (mid, active))
 
@@ -338,13 +428,15 @@ class Store(object):
         if row:
             if row["active"]:
                 raise ValueError("代工厂「%s」已存在" % name)
-            self.conn.execute("UPDATE factories SET active=1 WHERE id=?", (row["id"],))
+            self.conn.execute("UPDATE factories SET active=1, updated_at=? WHERE id=?",
+                              (now_full(), row["id"]))
             self.conn.commit()
             self.mark_dirty("factory_restore", row["id"])
             return row["id"]
         cur = self.conn.execute(
-            "INSERT INTO factories(name, contact, note, active, created_at) VALUES(?,?,?,1,?)",
-            (name, contact or "", note or "", now_str()),
+            "INSERT INTO factories(name, contact, note, active, uid, updated_at, created_at)"
+            " VALUES(?,?,?,1,?,?,?)",
+            (name, contact or "", note or "", str(uuid.uuid4()), now_full(), now_str()),
         )
         self.conn.commit()
         self.mark_dirty("factory_add", name)
@@ -360,6 +452,8 @@ class Store(object):
                 args.append(kw[f])
         if not sets:
             return
+        sets.append("updated_at=?")
+        args.append(now_full())
         args.append(fid)
         try:
             self.conn.execute("UPDATE factories SET %s WHERE id=?" % ", ".join(sets), args)
@@ -370,7 +464,8 @@ class Store(object):
 
     @_locked
     def set_factory_active(self, fid, active):
-        self.conn.execute("UPDATE factories SET active=? WHERE id=?", (1 if active else 0, fid))
+        self.conn.execute("UPDATE factories SET active=?, updated_at=? WHERE id=?",
+                          (1 if active else 0, now_full(), fid))
         self.conn.commit()
         self.mark_dirty("factory_active", "%s -> %s" % (fid, active))
 
@@ -459,10 +554,11 @@ class Store(object):
         ts = ts or now_str()
         self.conn.execute(
             "INSERT INTO records(ts, type, material_id, factory_id, delta, quality,"
-            " batch, operator, note, voided, created_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,0,?)",
+            " batch, operator, note, voided, uid, updated_at, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?)",
             (ts, rtype, material_id, factory_id, delta, quality,
-             batch or "", operator or "", note or "", now_str()),
+             batch or "", operator or "", note or "",
+             str(uuid.uuid4()), now_full(), now_str()),
         )
         self.conn.commit()
         rid = self.conn.execute("SELECT last_insert_rowid() id").fetchone()["id"]
@@ -471,7 +567,8 @@ class Store(object):
 
     @_locked
     def void_record(self, rid, voided=True):
-        self.conn.execute("UPDATE records SET voided=? WHERE id=?", (1 if voided else 0, rid))
+        self.conn.execute("UPDATE records SET voided=?, updated_at=? WHERE id=?",
+                          (1 if voided else 0, now_full(), rid))
         self.conn.commit()
         self.mark_dirty("void_record", "记录 #%d %s" % (rid, "作废" if voided else "恢复"))
 

@@ -405,6 +405,90 @@ class CloudBackup(object):
         except Exception:
             return []
 
+    # ================= 多端同步 =================
+    #
+    # 同步包是一个固定名字的 JSON 文件，两端都读写它。
+    # 用固定名字（而不是时间戳）是为了「始终只有一个同步包」，
+    # 每次上传都覆盖它，下载的永远是最新的那份。
+
+    SYNC_FILENAME = "_同步包_请勿手动修改.json"
+
+    def _open_session(self, timeout):
+        base = self._base()
+        jar = http.cookiejar.CookieJar()
+        op = self._opener(jar)
+        self._login(op, base, self.config()["password"], timeout)
+        return base, op
+
+    def push_sync(self, payload_text, timeout=60):
+        """把同步包传上去（同名覆盖）。"""
+        c = self.config()
+        if not c["url"] or not c["password"]:
+            return UploadResult(False, "没配置备份地址或密码")
+        try:
+            base, op = self._open_session(timeout)
+            data = payload_text.encode("utf-8")
+            q = urllib.parse.urlencode({"name": self.SYNC_FILENAME, "sameName": "false"})
+            req = urllib.request.Request(
+                base + "/api/files?" + q, data=data, method="POST",
+                headers={"content-type": "application/json; charset=utf-8",
+                         "User-Agent": UA})
+            with op.open(req, timeout=timeout) as r:
+                raw = r.read().decode("utf-8", "replace")
+            d = json.loads(raw)
+            if d.get("ok") is not True:
+                return UploadResult(False, d.get("message") or "上传被拒绝")
+            res = (d.get("results") or [{}])[0]
+            f = res.get("file") or {}
+            return UploadResult(True, "同步包已上传（%d KB）" % max(1, len(data) // 1024),
+                                self.SYNC_FILENAME, f.get("id", ""), res.get("action", ""))
+        except urllib.error.HTTPError as ex:
+            return UploadResult(False, "服务器返回 HTTP %d" % ex.code)
+        except urllib.error.URLError as ex:
+            return UploadResult(False, "连不上服务器：%s" % getattr(ex, "reason", ex))
+        except Exception as ex:
+            return UploadResult(False, str(ex))
+
+    def find_sync_file(self, timeout=25):
+        """
+        在云端找同步包。可能有多份同名历史（服务端会保留旧版本），
+        取 updated 最新的那个。
+        """
+        files = self.list_remote(timeout=timeout)
+        cands = [f for f in files if f.get("name") == self.SYNC_FILENAME]
+        if not cands:
+            return None
+        cands.sort(key=lambda f: f.get("updated") or 0, reverse=True)
+        return cands[0]
+
+    def pull_sync(self, timeout=60):
+        """
+        下载同步包。返回 (ok, payload_dict_or_None, message)。
+        """
+        c = self.config()
+        if not c["url"] or not c["password"]:
+            return False, None, "没配置备份地址或密码"
+        try:
+            base, op = self._open_session(timeout)
+            f = self.find_sync_file(timeout=timeout)
+            if not f:
+                return False, None, "云端还没有同步包（先在某一端点「上传同步」）"
+            req = urllib.request.Request(
+                "%s/api/files/%s/download" % (base, f["id"]),
+                headers={"User-Agent": UA})
+            with op.open(req, timeout=timeout) as r:
+                raw = r.read()
+            payload = json.loads(raw.decode("utf-8", "replace"))
+            return True, payload, "已下载同步包"
+        except urllib.error.HTTPError as ex:
+            return False, None, "服务器返回 HTTP %d" % ex.code
+        except urllib.error.URLError as ex:
+            return False, None, "连不上服务器：%s" % getattr(ex, "reason", ex)
+        except ValueError:
+            return False, None, "云端文件不是有效的同步包"
+        except Exception as ex:
+            return False, None, str(ex)
+
 
 # ------------------------------------------------------------------ 工具
 

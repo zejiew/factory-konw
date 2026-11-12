@@ -22,6 +22,7 @@ from db import (Store, TYPE_LABELS, COMMON_UNITS, fmt_qty, now_str, today_str,
                 material_display, EPS,
                 QUALITY_LABELS, QUALITY_GOOD, QUALITY_DEFECT)
 import cloud as cloud_mod
+from sync import SyncEngine
 
 APP_TITLE = "代工厂物料台账"
 
@@ -1143,6 +1144,33 @@ class App(tk.Tk):
 
         tk.Frame(left, bg=C_LINE, height=1).pack(fill="x", padx=16)
 
+        # ---------------- 多端同步 ----------------
+        sync_box = tk.Frame(left, bg=C_CARD)
+        sync_box.pack(fill="x", padx=16, pady=(10, 6))
+        tk.Label(sync_box, text="多端同步", font=self.opt["font_h2"],
+                 bg=C_CARD).pack(anchor="w")
+        tk.Label(sync_box,
+                 text="先把本机的账上传，再在另一台点「从云端同步」，两边的账会合并到一起，"
+                      "不会互相覆盖。",
+                 bg=C_CARD, fg=C_MUTED, font=(self.font_name, 9), anchor="w",
+                 wraplength=560, justify="left").pack(anchor="w", pady=(2, 8))
+
+        sbtn = tk.Frame(sync_box, bg=C_CARD)
+        sbtn.pack(fill="x")
+        self.btn_sync_push = ttk.Button(sbtn, text="上传本机数据到云端",
+                                        command=self.sync_push)
+        self.btn_sync_push.pack(side="left")
+        self.btn_sync_pull = ttk.Button(sbtn, text="从云端同步",
+                                        command=self.sync_pull)
+        self.btn_sync_pull.pack(side="left", padx=8)
+
+        self.lbl_sync_state = tk.Label(sync_box, text="", bg=C_CARD, fg=C_MUTED,
+                                       font=(self.font_name, 9), anchor="w",
+                                       wraplength=560, justify="left")
+        self.lbl_sync_state.pack(anchor="w", pady=(8, 0))
+
+        tk.Frame(left, bg=C_LINE, height=1).pack(fill="x", padx=16)
+
         stf = tk.Frame(left, bg=C_CARD)
         stf.pack(fill="x", padx=16, pady=(10, 14))
         tk.Label(stf, text="上次结果", font=self.opt["font_bold"], bg=C_CARD).grid(
@@ -1184,6 +1212,7 @@ class App(tk.Tk):
         self.lbl_cloud_list.pack(fill="x", padx=14, pady=(0, 10))
 
         self.cloud = cloud_mod.CloudBackup(self.store)
+        self.sync_engine = SyncEngine(self.store)
         self._cloud_busy = False
         self._load_cloud_config()
         self.refresh_cloud_state()
@@ -1267,8 +1296,15 @@ class App(tk.Tk):
 
         # 手动备份不要求开关是开的 —— 用户当场点就是想传一次
         can_manual = bool(c["url"] and c["password"]) and not self._cloud_busy
-        self.btn_cloud_now.config(state=("normal" if can_manual else "disabled"))
         self.btn_cloud_test.config(state=("disabled" if (self._cloud_busy or not c["url"]) else "normal"))
+        if hasattr(self, "btn_cloud_now"):
+            self.btn_cloud_now.config(state=("normal" if can_manual else "disabled"))
+        # 同步按钮跟「填了地址和密码」绑定，不要求开总开关——
+        # 手动同步是明确的用户动作，不该被自动备份的开关挡住
+        if hasattr(self, "btn_sync_push"):
+            st = "normal" if can_manual else "disabled"
+            self.btn_sync_push.config(state=st)
+            self.btn_sync_pull.config(state=st)
 
     def _cloud_mode_key(self):
         return "stock" if "库存" in self.v_cloud_mode.get() and "全部" not in self.v_cloud_mode.get() else "all"
@@ -1362,6 +1398,143 @@ class App(tk.Tk):
                     messagebox.showerror(APP_TITLE, "上传失败：\n\n%s" % res.message, parent=self)
             if res.ok:
                 self.after(400, self.load_cloud_files)
+
+        self.after(300, poll)
+
+    # ---------------------------------------------------------------- 多端同步
+
+    def _sync_ready(self):
+        c = self.cloud.config()
+        if not c["url"] or not c["password"]:
+            messagebox.showwarning(
+                APP_TITLE,
+                "同步要用云端备份的地址和密码。\n\n先在上面填好备份地址和访问密码并保存。",
+                parent=self)
+            return False
+        return True
+
+    def sync_push(self):
+        """把本机全量数据做成同步包传上去（覆盖云端那份）。"""
+        if self._cloud_busy or not self._sync_ready():
+            return
+        if not messagebox.askyesno(
+                APP_TITLE,
+                "这会把本机当前的全部数据上传成云端同步包，\n覆盖云端原来那份。\n\n"
+                "如果另一台电脑上有云端还没有的记录，\n建议先在那台点「上传」，再回到这台点「从云端同步」。\n\n继续吗？",
+                parent=self):
+            return
+
+        self._cloud_busy = True
+        self.refresh_cloud_state()
+        self.btn_sync_push.config(text="上传中…")
+        q = queue.Queue()
+
+        def worker():
+            try:
+                payload = self.sync_engine.export_payload(full=True)
+                text = self.sync_engine.payload_to_json(payload)
+                res = self.cloud.push_sync(text)
+                q.put((res, payload))
+            except Exception as ex:
+                q.put((cloud_mod.UploadResult(False, str(ex)), None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        def poll():
+            try:
+                res, payload = q.get_nowait()
+            except queue.Empty:
+                self.after(300, poll)
+                return
+            self._cloud_busy = False
+            self.btn_sync_push.config(text="上传本机数据到云端")
+            self.refresh_cloud_state()
+            if res.ok and payload:
+                n = (len(payload["tables"]["materials"]), len(payload["tables"]["factories"]),
+                     len(payload["tables"]["records"]))
+                msg = "已上传：材料 %d、代工厂 %d、流水 %d 条\n\n%s" % (n[0], n[1], n[2], res.message)
+                self.lbl_sync_state.config(
+                    text="上次上传：%s\n%s" % (now_str(), msg.split("\n")[0]), fg=C_IN)
+                messagebox.showinfo(APP_TITLE, msg, parent=self)
+            else:
+                self.lbl_sync_state.config(text="上传失败：%s" % res.message, fg=C_OUT)
+                messagebox.showerror(APP_TITLE, "上传失败：\n\n%s" % res.message, parent=self)
+
+        self.after(300, poll)
+
+    def sync_pull(self):
+        """从云端下载同步包，预览后合并进本地。"""
+        if self._cloud_busy or not self._sync_ready():
+            return
+        self._cloud_busy = True
+        self.refresh_cloud_state()
+        self.btn_sync_pull.config(text="下载中…")
+        q = queue.Queue()
+
+        def worker():
+            try:
+                okk, payload, msg = self.cloud.pull_sync()
+                q.put((okk, payload, msg))
+            except Exception as ex:
+                q.put((False, None, str(ex)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        def poll():
+            try:
+                okk, payload, msg = q.get_nowait()
+            except queue.Empty:
+                self.after(300, poll)
+                return
+            self._cloud_busy = False
+            self.btn_sync_pull.config(text="从云端同步")
+            self.refresh_cloud_state()
+
+            if not okk or not payload:
+                self.lbl_sync_state.config(text="同步失败：%s" % msg, fg=C_OUT)
+                messagebox.showerror(APP_TITLE, "下载失败：\n\n%s" % msg, parent=self)
+                return
+
+            # 预览：算出会带来什么变化，让用户确认
+            try:
+                pv = self.sync_engine.preview(payload)
+                text = SyncEngine.summary_text(pv)
+            except Exception as ex:
+                messagebox.showerror(APP_TITLE, "同步包无法识别：\n\n%s" % ex, parent=self)
+                return
+
+            detail = []
+            names = {"materials": "材料", "factories": "代工厂", "records": "流水"}
+            for t in ("materials", "factories", "records"):
+                s2 = pv.get(t) or {}
+                detail.append("  %s：新增 %d，更新 %d，相同 %d，本地较新 %d" % (
+                    names[t], s2.get("add", 0), s2.get("update", 0),
+                    s2.get("same", 0), s2.get("local_newer", 0)))
+
+            body = text + "\n\n" + "\n".join(detail) + "\n\n要导入吗？"
+            if not messagebox.askyesno(APP_TITLE, body, parent=self):
+                self.lbl_sync_state.config(text="已取消，本地数据未改动", fg=C_MUTED)
+                return
+
+            # 执行合并
+            try:
+                merged = self.sync_engine.merge(payload)
+            except Exception as ex:
+                messagebox.showerror(APP_TITLE, "合并失败：\n\n%s" % ex, parent=self)
+                return
+
+            self.refresh_all()
+            st = self.store.stats()
+            self.lbl_sync_state.config(
+                text="上次同步：%s\n材料 %d、代工厂 %d、流水 %d 条" %
+                     (now_str(), st["materials"], st["factories"], st["records"]),
+                fg=C_IN)
+            messagebox.showinfo(
+                APP_TITLE,
+                "同步完成。\n\n本地现在是：材料 %d、代工厂 %d、流水 %d 条。"
+                % (st["materials"], st["factories"], st["records"]),
+                parent=self)
+            self.auto_cloud_after_save()
 
         self.after(300, poll)
 
