@@ -197,34 +197,49 @@ class CloudBackup(object):
 
         if mode == "stock":
             buf.write("=== 当前库存 ===\n")
-            buf.write("材料,规格,单位,代工厂,结存数量,最近变动\n")
+            buf.write("材料,规格,单位,代工厂,结存数量,良品,不良品,未分品质,最近变动\n")
             for item in st.stock_overview():
                 m = item["material"]
+                split = bool(int(m.get("quality_split") or 0))
                 if not item["children"]:
-                    buf.write(_row([m["name"], m["spec"], m["unit"], "（无记录）", "0", ""]))
+                    buf.write(_row([m["name"], m["spec"], m["unit"], "（无记录）", "0",
+                                    "0", "0", "0", ""]))
+                    continue
                 for c in item["children"]:
                     buf.write(_row([m["name"], m["spec"], m["unit"], c["factory_name"],
-                                    _q(c["qty"]), c["last_ts"]]))
+                                    _q(c["qty"]),
+                                    _q(c["good"]) if split else "",
+                                    _q(c["defect"]) if split else "",
+                                    _q(c["other"]) if split else "",
+                                    c["last_ts"]]))
             return buf.getvalue()
 
         buf.write("=== 当前库存 ===\n")
-        buf.write("材料,规格,单位,分类,代工厂,结存数量,安全库存,最近变动\n")
+        buf.write("材料,规格,单位,分类,代工厂,结存数量,良品,不良品,未分品质,安全库存,最近变动\n")
         for item in st.stock_overview():
             m = item["material"]
+            split = bool(int(m.get("quality_split") or 0))
             if not item["children"]:
                 buf.write(_row([m["name"], m["spec"], m["unit"], m["category"],
-                                "（无记录）", "0", _q(m["min_qty"]), ""]))
+                                "（无记录）", "0", "0", "0", "0",
+                                _q(m["min_qty"]), ""]))
+                continue
             for c in item["children"]:
                 buf.write(_row([m["name"], m["spec"], m["unit"], m["category"],
-                                c["factory_name"], _q(c["qty"]), _q(m["min_qty"]),
-                                c["last_ts"]]))
+                                c["factory_name"], _q(c["qty"]),
+                                _q(c["good"]) if split else "",
+                                _q(c["defect"]) if split else "",
+                                _q(c["other"]) if split else "",
+                                _q(m["min_qty"]), c["last_ts"]]))
         buf.write("\n")
 
         buf.write("=== 材料清单 ===\n")
-        buf.write("材料,规格,单位,分类,安全库存,备注,状态\n")
+        buf.write("材料,规格,单位,分类,安全库存,品质区分,备注,状态\n")
         for m in st.list_materials(active_only=False):
             buf.write(_row([m["name"], m["spec"], m["unit"], m["category"],
-                            _q(m["min_qty"]), m["note"],
+                            _q(m["min_qty"]),
+                            "良品/不良品" if int(m.get("quality_split") or 0) else "",
+                            m["note"],
                             "在用" if m["active"] else "已停用"]))
         buf.write("\n")
 
@@ -235,13 +250,14 @@ class CloudBackup(object):
                             "在用" if f["active"] else "已停用"]))
         buf.write("\n")
 
-        from db import TYPE_LABELS
+        from db import TYPE_LABELS, QUALITY_LABELS
         buf.write("=== 全部流水 ===\n")
-        buf.write("时间,类型,材料,规格,单位,代工厂,数量,批次/单号,经办人,备注,状态\n")
+        buf.write("时间,类型,材料,规格,品质,单位,代工厂,数量,批次/单号,经办人,备注,状态\n")
         rows = st.list_records(include_voided=True, limit=200000)
         for r in rows:
             buf.write(_row([r["ts"], TYPE_LABELS.get(r["type"], r["type"]),
-                            r["material_name"], r["material_spec"], r["unit"],
+                            r["material_name"], r["material_spec"],
+                            QUALITY_LABELS.get(r.get("quality") or "", ""), r["unit"],
                             r["factory_name"], _q(r["delta"]), r["batch"],
                             r["operator"], r["note"],
                             "已作废" if r["voided"] else "有效"]))

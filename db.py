@@ -34,6 +34,14 @@ BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 
 TYPE_LABELS = {"IN": "入库", "OUT": "消耗", "RETURN": "退回", "ADJUST": "盘点"}
 LABEL_TYPES = {v: k for k, v in TYPE_LABELS.items()}
+
+# 良品 / 不良品。空字符串 = 该材料不区分品质（默认行为）。
+# 注意：这里只管「这一笔流水算良品还是不良品」，仓库总数永远是两者之和，
+# 不额外存一个总数字段，避免出现「良品+不良品 ≠ 总数」的账实不符。
+QUALITY_LABELS = {"": "", "good": "良品", "defect": "不良品"}
+QUALITY_GOOD = "good"
+QUALITY_DEFECT = "defect"
+
 COMMON_UNITS = ["个", "件", "套", "千克", "克", "吨", "米", "平方米", "立方米", "升", "卷", "张", "箱", "包", "袋"]
 
 EPS = 1e-9
@@ -111,6 +119,7 @@ class Store(object):
                 min_qty    REAL    NOT NULL DEFAULT 0,
                 note       TEXT    NOT NULL DEFAULT '',
                 active     INTEGER NOT NULL DEFAULT 1,
+                quality_split INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT    NOT NULL
             );
             CREATE UNIQUE INDEX IF NOT EXISTS ux_material ON materials(name, spec);
@@ -134,6 +143,7 @@ class Store(object):
                 batch       TEXT    NOT NULL DEFAULT '',
                 operator    TEXT    NOT NULL DEFAULT '',
                 note        TEXT    NOT NULL DEFAULT '',
+                quality     TEXT    NOT NULL DEFAULT '',
                 voided      INTEGER NOT NULL DEFAULT 0,
                 created_at  TEXT    NOT NULL
             );
@@ -157,6 +167,28 @@ class Store(object):
             """
         )
         c.commit()
+        self._migrate()
+
+    def _migrate(self):
+        """
+        老的库缺列时补上。全部用 ADD COLUMN，不动已有数据。
+
+        加过的列：
+          materials.quality_split  该材料是否启用良品/不良品区分
+          records.quality          这一笔流水算良品还是不良品
+        """
+        c = self.conn
+
+        def cols(table):
+            return {r[1] for r in c.execute("PRAGMA table_info(%s)" % table)}
+
+        if "quality_split" not in cols("materials"):
+            c.execute("ALTER TABLE materials ADD COLUMN quality_split INTEGER NOT NULL DEFAULT 0")
+            c.commit()
+
+        if "quality" not in cols("records"):
+            c.execute("ALTER TABLE records ADD COLUMN quality TEXT NOT NULL DEFAULT ''")
+            c.commit()
 
     # ---------------- 设置项
 
@@ -217,7 +249,7 @@ class Store(object):
         ).fetchone()
 
     @_locked
-    def add_material(self, name, spec="", unit="", category="", min_qty=0, note=""):
+    def add_material(self, name, spec="", unit="", category="", min_qty=0, note="", quality_split=0):
         name = (name or "").strip()
         spec = (spec or "").strip()
         if not name:
@@ -231,9 +263,10 @@ class Store(object):
             self.mark_dirty("material_restore", exist["id"])
             return exist["id"]
         cur = self.conn.execute(
-            "INSERT INTO materials(name, spec, unit, category, min_qty, note, active, created_at)"
-            " VALUES(?,?,?,?,?,?,1,?)",
-            (name, spec, unit or "", category or "", float(min_qty or 0), note or "", now_str()),
+            "INSERT INTO materials(name, spec, unit, category, min_qty, note, active,"
+            " quality_split, created_at) VALUES(?,?,?,?,?,?,1,?,?)",
+            (name, spec, unit or "", category or "", float(min_qty or 0), note or "",
+             1 if quality_split else 0, now_str()),
         )
         self.conn.commit()
         self.mark_dirty("material_add", name)
@@ -241,7 +274,7 @@ class Store(object):
 
     @_locked
     def update_material(self, mid, **kw):
-        fields = ["name", "spec", "unit", "category", "min_qty", "note"]
+        fields = ["name", "spec", "unit", "category", "min_qty", "note", "quality_split"]
         sets, args = [], []
         for f in fields:
             if f in kw:
@@ -350,19 +383,45 @@ class Store(object):
     # ---------------- 流水
 
     @_locked
-    def balance(self, material_id, factory_id):
-        row = self.conn.execute(
-            "SELECT COALESCE(SUM(delta),0) q FROM records"
-            " WHERE material_id=? AND factory_id=? AND voided=0",
-            (material_id, factory_id),
-        ).fetchone()
+    def balance(self, material_id, factory_id, quality=None):
+        """
+        结存。quality=None 表示不分品质、返回总数（= 良品 + 不良品）；
+        传 "good" / "defect" 只算该品质的结存。
+        """
+        sql = ("SELECT COALESCE(SUM(delta),0) q FROM records"
+               " WHERE material_id=? AND factory_id=? AND voided=0")
+        args = [material_id, factory_id]
+        if quality is not None:
+            sql += " AND quality=?"
+            args.append(quality)
+        row = self.conn.execute(sql, args).fetchone()
         return float(row["q"]) if row else 0.0
 
     @_locked
-    def add_record(self, rtype, material_id, factory_id, qty, ts=None, batch="", operator="", note="", target_qty=None):
+    def balance_split(self, material_id, factory_id):
+        """返回 (良品, 不良品, 总数)。没开品质选项的材料，全部算良品口径之外的总数。"""
+        rows = self.conn.execute(
+            "SELECT quality, COALESCE(SUM(delta),0) q FROM records"
+            " WHERE material_id=? AND factory_id=? AND voided=0 GROUP BY quality",
+            (material_id, factory_id),
+        ).fetchall()
+        good = defect = other = 0.0
+        for r in rows:
+            if r["quality"] == QUALITY_GOOD:
+                good += float(r["q"] or 0)
+            elif r["quality"] == QUALITY_DEFECT:
+                defect += float(r["q"] or 0)
+            else:
+                other += float(r["q"] or 0)
+        return good, defect, good + defect + other
+
+    @_locked
+    def add_record(self, rtype, material_id, factory_id, qty, ts=None, batch="", operator="", note="",
+                   target_qty=None, quality=""):
         """
         rtype: IN 入库 / OUT 消耗 / RETURN 退回 / ADJUST 盘点
         入库数量一律传正数；盘点传 target_qty（实盘数量），内部换算成差额。
+        quality: "good" 良品 / "defect" 不良品 / "" 不区分（该材料没开品质选项时）
         """
         rtype = rtype.upper()
         if rtype not in TYPE_LABELS:
@@ -372,12 +431,22 @@ class Store(object):
         if not factory_id:
             raise ValueError("请选择代工厂")
 
+        quality = (quality or "").strip()
+        if quality not in QUALITY_LABELS:
+            raise ValueError("未知的品质标记：%s" % quality)
+
+        # 材料没开「良品/不良品」时，一律记成不区分，避免界面传了值污染数据
+        mat = self.material_by_id(material_id)
+        if mat is not None and not int(mat.get("quality_split") or 0):
+            quality = ""
+
         qty = round(float(qty or 0), 4)
 
         if rtype == "ADJUST":
             if target_qty is None:
                 raise ValueError("盘点需要填写实盘数量")
-            cur = self.balance(material_id, factory_id)
+            # 盘点按「同品质」的结存算差额，否则良品盘成不良品会被算成大额差异
+            cur = self.balance(material_id, factory_id, quality)
             delta = round(float(target_qty) - cur, 4)
         else:
             if qty <= 0:
@@ -389,9 +458,11 @@ class Store(object):
 
         ts = ts or now_str()
         self.conn.execute(
-            "INSERT INTO records(ts, type, material_id, factory_id, delta, batch, operator, note, voided, created_at)"
-            " VALUES(?,?,?,?,?,?,?,?,0,?)",
-            (ts, rtype, material_id, factory_id, delta, batch or "", operator or "", note or "", now_str()),
+            "INSERT INTO records(ts, type, material_id, factory_id, delta, quality,"
+            " batch, operator, note, voided, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,0,?)",
+            (ts, rtype, material_id, factory_id, delta, quality,
+             batch or "", operator or "", note or "", now_str()),
         )
         self.conn.commit()
         rid = self.conn.execute("SELECT last_insert_rowid() id").fetchone()["id"]
@@ -453,23 +524,47 @@ class Store(object):
         result = []
         for m in self.list_materials(keyword=keyword, active_only=True):
             rows = self.conn.execute(
-                "SELECT factory_id, SUM(delta) qty, MAX(ts) last_ts, COUNT(*) n"
-                " FROM records WHERE material_id=? AND voided=0 GROUP BY factory_id",
+                "SELECT factory_id, quality, SUM(delta) qty, MAX(ts) last_ts"
+                " FROM records WHERE material_id=? AND voided=0"
+                " GROUP BY factory_id, quality",
                 (m["id"],),
             ).fetchall()
             facs = {f["id"]: f["name"] for f in self.list_factories(active_only=False)}
-            children = []
+
+            # 按厂聚合：每个厂名下再分良品 / 不良品
+            per_fac = {}
             for r in rows:
-                children.append({
-                    "factory_id": r["factory_id"],
-                    "factory_name": facs.get(r["factory_id"], "(已删除)"),
-                    "qty": float(r["qty"] or 0),
-                    "last_ts": r["last_ts"] or "",
+                fid = r["factory_id"]
+                d = per_fac.setdefault(fid, {
+                    "factory_id": fid,
+                    "factory_name": facs.get(fid, "(已删除)"),
+                    "good": 0.0, "defect": 0.0, "other": 0.0,
+                    "last_ts": "",
                 })
+                q = float(r["qty"] or 0)
+                if r["quality"] == QUALITY_GOOD:
+                    d["good"] += q
+                elif r["quality"] == QUALITY_DEFECT:
+                    d["defect"] += q
+                else:
+                    d["other"] += q
+                if (r["last_ts"] or "") > d["last_ts"]:
+                    d["last_ts"] = r["last_ts"] or ""
+
+            children = []
+            for d in per_fac.values():
+                d["qty"] = d["good"] + d["defect"] + d["other"]
+                children.append(d)
             children.sort(key=lambda x: (-abs(x["qty"]), x["factory_name"]))
+
             total = sum(c["qty"] for c in children)
+            total_good = sum(c["good"] for c in children)
+            total_defect = sum(c["defect"] for c in children)
             last = max([c["last_ts"] for c in children] or [""])
-            result.append({"material": m, "total": total, "children": children, "last_ts": last})
+            result.append({
+                "material": m, "total": total, "children": children, "last_ts": last,
+                "good": total_good, "defect": total_defect,
+            })
         return result
 
     @_locked
@@ -502,12 +597,14 @@ class Store(object):
         rows = self.list_records(**filters)
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
-            w.writerow(["时间", "类型", "材料", "规格", "单位", "代工厂", "数量",
+            w.writerow(["时间", "类型", "材料", "规格", "品质", "单位", "代工厂", "数量",
                         "批次/单号", "经办人", "备注", "状态"])
             for r in rows:
                 w.writerow([
                     r["ts"], TYPE_LABELS.get(r["type"], r["type"]),
-                    r["material_name"], r["material_spec"], r["unit"], r["factory_name"],
+                    r["material_name"], r["material_spec"],
+                    QUALITY_LABELS.get(r.get("quality") or "", ""),
+                    r["unit"], r["factory_name"],
                     fmt_qty(r["delta"]), r["batch"], r["operator"], r["note"],
                     "已作废" if r["voided"] else "有效",
                 ])
@@ -518,14 +615,22 @@ class Store(object):
         data = self.stock_overview()
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
-            w.writerow(["材料", "规格", "单位", "代工厂", "结存数量", "最近变动"])
+            w.writerow(["材料", "规格", "单位", "代工厂", "结存数量",
+                        "良品", "不良品", "未分品质", "最近变动"])
             for item in data:
                 m = item["material"]
+                split = bool(int(m.get("quality_split") or 0))
                 if not item["children"]:
-                    w.writerow([m["name"], m["spec"], m["unit"], "（无记录）", "0", ""])
+                    w.writerow([m["name"], m["spec"], m["unit"], "（无记录）", "0",
+                                "0", "0", "0", ""])
+                    continue
                 for c in item["children"]:
                     w.writerow([m["name"], m["spec"], m["unit"], c["factory_name"],
-                                fmt_qty(c["qty"]), c["last_ts"]])
+                                fmt_qty(c["qty"]),
+                                fmt_qty(c["good"]) if split else "",
+                                fmt_qty(c["defect"]) if split else "",
+                                fmt_qty(c["other"]) if split else "",
+                                c["last_ts"]])
         return len(data)
 
     # ---------------- 待备份改动队列（供云端备份使用）

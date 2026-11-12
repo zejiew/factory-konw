@@ -19,7 +19,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 from db import (Store, TYPE_LABELS, COMMON_UNITS, fmt_qty, now_str, today_str,
-                material_display, EPS)
+                material_display, EPS,
+                QUALITY_LABELS, QUALITY_GOOD, QUALITY_DEFECT)
 import cloud as cloud_mod
 
 APP_TITLE = "代工厂物料台账"
@@ -342,6 +343,7 @@ class App(tk.Tk):
             m = item["material"]
             unit = m["unit"] or ""
             total = item["total"]
+            split = bool(int(m.get("quality_split") or 0))
             tags = ["parent"]
             if m["id"] in lows:
                 tags.append("low")
@@ -349,6 +351,10 @@ class App(tk.Tk):
             if m["spec"]:
                 label += "   " + m["spec"]
             note = "共 %d 个厂" % len(item["children"])
+            if split:
+                note = "良品 %s ／ 不良品 %s　·　共 %d 个厂" % (
+                    fmt_qty(item["good"]), fmt_qty(item["defect"]),
+                    len(item["children"]))
             if m["id"] in lows:
                 note += "　● 低于安全库存 %s" % fmt_qty(m["min_qty"])
             elif total <= EPS:
@@ -363,9 +369,15 @@ class App(tk.Tk):
                     continue
                 ctags = ("odd",) if idx % 2 else ()
                 idx += 1
+                qty_txt = fmt_qty(c["qty"]) + (" " + unit if unit else "")
+                cnote = ""
+                if split:
+                    qty_txt = "总数 " + qty_txt
+                    cnote = "良品 %s ／ 不良品 %s%s" % (
+                        fmt_qty(c["good"]), fmt_qty(c["defect"]),
+                        (" ／ 未分 %s" % fmt_qty(c["other"])) if abs(c["other"]) > EPS else "")
                 tv.insert(pid, "end", text="     " + c["factory_name"],
-                          values=(fmt_qty(c["qty"]) + (" " + unit if unit else ""),
-                                  c["last_ts"], ""), tags=ctags)
+                          values=(qty_txt, c["last_ts"], cnote), tags=ctags)
 
         st = self.store.stats()
         for k, w in self.card_widgets.items():
@@ -430,6 +442,7 @@ class App(tk.Tk):
         self.v_q_note = tk.StringVar()
         self.v_q_date = tk.StringVar(value=today_str())
         self.v_q_time = tk.StringVar(value=now_str()[11:])
+        self.v_q_quality = tk.StringVar(value="良品")
 
         lab(grid, "材料", 0, 0)
         self.cb_q_material = ttk.Combobox(grid, textvariable=self.v_q_material, state="readonly")
@@ -450,6 +463,29 @@ class App(tk.Tk):
 
         lab(grid, "批次 / 单号", 1, 2)
         ttk.Entry(grid, textvariable=self.v_q_batch).grid(row=1, column=3, sticky="ew", pady=6)
+
+        # 品质：只有勾了「区分良品/不良品」的材料才显示这一行
+        self.quality_row = tk.Frame(grid, bg=C_CARD)
+        self.quality_row.grid(row=4, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        tk.Label(self.quality_row, text="品质", bg=C_CARD, fg=C_MUTED,
+                 font=self.opt["font"], width=8, anchor="e").pack(side="left", padx=(0, 10))
+        self.rb_q_good = tk.Radiobutton(
+            self.quality_row, text="良品", value="良品", variable=self.v_q_quality,
+            bg=C_CARD, fg=C_IN, font=(self.font_name, 10, "bold"), activebackground=C_CARD,
+            selectcolor="#ffffff", highlightthickness=0, bd=0, cursor="hand2",
+            command=self._on_quality_change)
+        self.rb_q_good.pack(side="left", padx=(0, 18))
+        self.rb_q_defect = tk.Radiobutton(
+            self.quality_row, text="不良品", value="不良品", variable=self.v_q_quality,
+            bg=C_CARD, fg=C_OUT, font=(self.font_name, 10, "bold"), activebackground=C_CARD,
+            selectcolor="#ffffff", highlightthickness=0, bd=0, cursor="hand2",
+            command=self._on_quality_change)
+        self.rb_q_defect.pack(side="left")
+        self.lbl_quality_hint = tk.Label(
+            self.quality_row, text="", bg=C_CARD, fg=C_MUTED,
+            font=(self.font_name, 8))
+        self.lbl_quality_hint.pack(side="left", padx=12)
+        self.quality_row.grid_remove()
 
         lab(grid, "经办人", 2, 0)
         ttk.Entry(grid, textvariable=self.v_q_operator).grid(row=2, column=1, sticky="ew", pady=6, padx=(0, 20))
@@ -515,13 +551,44 @@ class App(tk.Tk):
         fid = self.fac_map.get(self.v_q_factory.get())
         m = self.store.material_by_id(mid) if mid else None
         self.lbl_unit.config(text=("单位：" + m["unit"]) if (m and m["unit"]) else "")
+
+        # 材料勾了「区分良品/不良品」才显示品质选择
+        split = bool(m and int(m.get("quality_split") or 0))
+        if split:
+            self.quality_row.grid()
+        else:
+            self.quality_row.grid_remove()
+            self.v_q_quality.set("良品")
+
         if mid and fid:
-            bal = self.store.balance(mid, fid)
-            unit = (m["unit"] if m else "") or ""
-            self.lbl_balance.config(
-                text="该厂当前结存：%s %s" % (fmt_qty(bal), unit))
+            unit = ((m["unit"] if m else "") or "")
+            if split:
+                good, defect, total = self.store.balance_split(mid, fid)
+                self.lbl_balance.config(
+                    text="该厂结存：总数 %s %s　｜　良品 %s　不良品 %s"
+                         % (fmt_qty(total), unit, fmt_qty(good), fmt_qty(defect)))
+            else:
+                bal = self.store.balance(mid, fid)
+                self.lbl_balance.config(
+                    text="该厂当前结存：%s %s" % (fmt_qty(bal), unit))
         else:
             self.lbl_balance.config(text="")
+        self._on_quality_change()
+
+    def _on_quality_change(self):
+        """选了品质后，把该品质的结存也提示出来，避免超扣。"""
+        mid = self.mat_map.get(self.v_q_material.get())
+        fid = self.fac_map.get(self.v_q_factory.get())
+        m = self.store.material_by_id(mid) if mid else None
+        split = bool(m and int(m.get("quality_split") or 0))
+        if not (split and mid and fid):
+            self.lbl_quality_hint.config(text="")
+            return
+        q = QUALITY_GOOD if self.v_q_quality.get() == "良品" else QUALITY_DEFECT
+        bal = self.store.balance(mid, fid, q)
+        unit = (m["unit"] if m else "") or ""
+        self.lbl_quality_hint.config(
+            text="（该品质结存 %s %s）" % (fmt_qty(bal), unit))
 
     def submit_quick(self):
         t = self.v_q_type.get()
@@ -543,23 +610,34 @@ class App(tk.Tk):
         ts = "%s %s" % (self.v_q_date.get().strip() or today_str(),
                         (self.v_q_time.get().strip() or now_str()[11:])[:5])
 
+        # 品质：只有该材料开了区分才带值，否则一律空
+        mat = self.store.material_by_id(mid)
+        if mat and int(mat.get("quality_split") or 0):
+            quality = QUALITY_GOOD if self.v_q_quality.get() == "良品" else QUALITY_DEFECT
+        else:
+            quality = ""
+        q_label = QUALITY_LABELS.get(quality, "")
+
         if t == "OUT" and qty > 0:
-            bal = self.store.balance(mid, fid)
+            bal = self.store.balance(mid, fid, quality if quality else None)
             if qty > bal + EPS:
+                what = ("「%s」的结存" % q_label) if q_label else "结存"
                 if not messagebox.askyesno(
                         APP_TITLE,
-                        "这次消耗比结存还多。\n当前结存 %s，本次消耗 %s，记完会变成 %s。\n\n确定要记吗？"
-                        % (fmt_qty(bal), fmt_qty(qty), fmt_qty(bal - qty)), parent=self):
+                        "这次消耗比%s还多。\n当前%s %s，本次消耗 %s，记完会变成 %s。\n\n确定要记吗？"
+                        % (what, what, fmt_qty(bal), fmt_qty(qty), fmt_qty(bal - qty)),
+                        parent=self):
                     return
 
         try:
             if t == "ADJUST":
                 self.store.add_record(t, mid, fid, 0, ts=ts, batch=self.v_q_batch.get(),
                                       operator=self.v_q_operator.get(), note=self.v_q_note.get(),
-                                      target_qty=qty)
+                                      target_qty=qty, quality=quality)
             else:
                 self.store.add_record(t, mid, fid, qty, ts=ts, batch=self.v_q_batch.get(),
-                                      operator=self.v_q_operator.get(), note=self.v_q_note.get())
+                                      operator=self.v_q_operator.get(), note=self.v_q_note.get(),
+                                      quality=quality)
         except Exception as ex:
             messagebox.showerror(APP_TITLE, str(ex), parent=self)
             return
@@ -567,7 +645,9 @@ class App(tk.Tk):
         self.v_q_qty.set("")
         self.v_q_batch.set("")
         self.v_q_note.set("")
-        self.set_status("已记录：%s %s %s" % (TYPE_LABELS[t], self.v_q_material.get(), fmt_qty(qty)), C_IN)
+        self.set_status("已记录：%s%s %s %s" % (
+            TYPE_LABELS[t], ("（%s）" % q_label) if q_label else "",
+            self.v_q_material.get(), fmt_qty(qty)), C_IN)
         self.refresh_all()
         self.auto_cloud_after_save()
         self._on_quick_material_change()
@@ -592,9 +672,14 @@ class App(tk.Tk):
             qty = "%s%s%s" % (sign, fmt_qty(r["delta"]), (" " + unit) if unit else "")
             if r["voided"]:
                 qty = "（已作废）" + qty
+            q = r.get("quality") or ""
+            qtag = QUALITY_LABELS.get(q, "")
+            mat_txt = r["material_name"] + (" " + r["material_spec"] if r["material_spec"] else "")
+            if qtag:
+                mat_txt += "  〔%s〕" % qtag
             tv.insert("", "end", iid=str(r["id"]),
                       values=(r["ts"][11:], TYPE_LABELS.get(r["type"], r["type"]),
-                              r["material_name"] + (" " + r["material_spec"] if r["material_spec"] else ""),
+                              mat_txt,
                               r["factory_name"], qty, r["batch"], r["operator"], r["note"]),
                       tags=tag)
         self.lbl_today.config(text="共 %d 条" % len(rows))
@@ -674,15 +759,16 @@ class App(tk.Tk):
 
         wrap = tk.Frame(root, bg=C_CARD, highlightbackground=C_LINE, highlightthickness=1)
         wrap.pack(fill="both", expand=True)
-        cols = ("ts", "type", "mat", "spec", "fac", "qty", "unit", "batch", "op", "note", "state")
+        cols = ("ts", "type", "mat", "spec", "quality", "fac", "qty", "unit", "batch", "op", "note", "state")
         self.tv_rec = ttk.Treeview(wrap, columns=cols, show="headings", height=16)
         for c, t, w, a, stretch in (
-                ("ts", "时间", 172, "center", False), ("type", "类型", 58, "center", False),
-                ("mat", "材料", 140, "w", True), ("spec", "规格", 142, "w", False),
-                ("fac", "代工厂", 130, "w", True), ("qty", "数量", 82, "e", False),
-                ("unit", "单位", 50, "center", False), ("batch", "批次/单号", 150, "w", False),
-                ("op", "经办人", 72, "w", False), ("note", "备注", 182, "w", True),
-                ("state", "状态", 60, "center", False)):
+                ("ts", "时间", 158, "center", False), ("type", "类型", 52, "center", False),
+                ("mat", "材料", 118, "w", True), ("spec", "规格", 110, "w", False),
+                ("quality", "品质", 66, "center", False),
+                ("fac", "代工厂", 118, "w", True), ("qty", "数量", 74, "e", False),
+                ("unit", "单位", 56, "center", False), ("batch", "批次/单号", 130, "w", False),
+                ("op", "经办人", 64, "w", False), ("note", "备注", 140, "w", True),
+                ("state", "状态", 56, "center", False)):
             self.tv_rec.heading(c, text=t, anchor=a)
             self.tv_rec.column(c, width=w, anchor=a, stretch=stretch)
         vs = ttk.Scrollbar(wrap, orient="vertical", command=self.tv_rec.yview)
@@ -736,9 +822,12 @@ class App(tk.Tk):
                     tin += r["delta"]
                 else:
                     tout += -r["delta"]
+            q = r.get("quality") or ""
             tv.insert("", "end", iid=str(r["id"]),
                       values=(r["ts"], TYPE_LABELS.get(r["type"], r["type"]),
-                              r["material_name"], r["material_spec"], r["factory_name"],
+                              r["material_name"], r["material_spec"],
+                              QUALITY_LABELS.get(q, ""),
+                              r["factory_name"],
                               sign + fmt_qty(r["delta"]), unit, r["batch"], r["operator"],
                               r["note"], "已作废" if r["voided"] else ""),
                       tags=tags)
@@ -796,13 +885,14 @@ class App(tk.Tk):
 
         wrap = tk.Frame(root, bg=C_CARD, highlightbackground=C_LINE, highlightthickness=1)
         wrap.pack(fill="both", expand=True)
-        cols = ("name", "spec", "unit", "cat", "minq", "qty", "note", "state")
+        cols = ("name", "spec", "unit", "cat", "minq", "qty", "quality", "note", "state")
         self.tv_mat = ttk.Treeview(wrap, columns=cols, show="headings", height=16)
         for c, t, w, a, stretch in (
-                ("name", "材料名称", 180, "w", True), ("spec", "规格", 140, "w", True),
-                ("unit", "单位", 64, "center", False), ("cat", "分类", 100, "w", False),
-                ("minq", "安全库存", 90, "e", False), ("qty", "当前总结存", 110, "e", False),
-                ("note", "备注", 220, "w", True), ("state", "状态", 70, "center", False)):
+                ("name", "材料名称", 170, "w", True), ("spec", "规格", 130, "w", True),
+                ("unit", "单位", 60, "center", False), ("cat", "分类", 92, "w", False),
+                ("minq", "安全库存", 86, "e", False), ("qty", "当前总结存", 104, "e", False),
+                ("quality", "品质区分", 88, "center", False),
+                ("note", "备注", 168, "w", True), ("state", "状态", 66, "center", False)):
             self.tv_mat.heading(c, text=t, anchor=a)
             self.tv_mat.column(c, width=w, anchor=a, stretch=stretch)
         vs = ttk.Scrollbar(wrap, orient="vertical", command=self.tv_mat.yview)
@@ -826,7 +916,9 @@ class App(tk.Tk):
             tv.insert("", "end", iid=str(r["id"]),
                       values=(r["name"], r["spec"], r["unit"], r["category"],
                               fmt_qty(r["min_qty"]) if r["min_qty"] else "",
-                              fmt_qty(r["qty"]), r["note"],
+                              fmt_qty(r["qty"]),
+                              "已启用" if int(r.get("quality_split") or 0) else "",
+                              r["note"],
                               "在用" if r["active"] else "已停用"),
                       tags=() if r["active"] else ("off",))
         self._sync_combos()
@@ -1381,6 +1473,8 @@ class MaterialDialog(tk.Toplevel):
         self.v_cat = tk.StringVar(value=(m["category"] if m else ""))
         self.v_min = tk.StringVar(value=(fmt_qty(m["min_qty"]) if m and m["min_qty"] else ""))
         self.v_note = tk.StringVar(value=(m["note"] if m else ""))
+        self.v_quality = tk.BooleanVar(
+            value=bool(m and int(m.get("quality_split") or 0)))
 
         def row(r, label, widget, hint=""):
             tk.Label(body, text=label, bg=C_BG, font=(self.f, 10), fg=C_MUTED, width=8,
@@ -1400,6 +1494,21 @@ class MaterialDialog(tk.Toplevel):
         row(4, "安全库存", ttk.Entry(body, textvariable=self.v_min, width=34),
             "低于此值在总览里标红；留空表示不设")
         row(5, "备注", ttk.Entry(body, textvariable=self.v_note, width=34))
+
+        # 良品 / 不良品：非必选，勾了才在出入库时出现品质下拉
+        tk.Label(body, text="品质", bg=C_BG, font=(self.f, 10), fg=C_MUTED, width=8,
+                 anchor="e").grid(row=6, column=0, sticky="e", pady=(10, 0), padx=(0, 10))
+        qf = tk.Frame(body, bg=C_BG)
+        qf.grid(row=6, column=1, columnspan=2, sticky="w", pady=(10, 0))
+        tk.Checkbutton(
+            qf, text="区分良品 / 不良品", variable=self.v_quality,
+            bg=C_BG, fg=C_TEXT, font=(self.f, 10), activebackground=C_BG,
+            selectcolor="#ffffff", highlightthickness=0, bd=0, anchor="w",
+            cursor="hand2").pack(side="left")
+        tk.Label(body, text="勾了之后，记这笔账时可以选良品/不良品；仓库总数 = 良品 + 不良品",
+                 bg=C_BG, font=(self.f, 8), fg="#9aa4b1", anchor="w",
+                 justify="left").grid(row=7, column=1, columnspan=2, sticky="w",
+                                      padx=(0, 8), pady=(0, 4))
 
         btns = tk.Frame(self, bg=C_BG)
         btns.pack(fill="x", padx=pad, pady=(0, pad))
@@ -1425,17 +1534,38 @@ class MaterialDialog(tk.Toplevel):
         except ValueError:
             messagebox.showwarning(APP_TITLE, "安全库存要填数字（或留空）", parent=self)
             return
+
+        qs = 1 if self.v_quality.get() else 0
+
+        # 从「区分」改回「不区分」时，要确认——已记的品质数据不会消失，
+        # 但之后不能再按品质记，容易让人困惑，所以先问一句。
+        if self.mid and not qs:
+            old = self.store.material_by_id(self.mid)
+            if old and int(old.get("quality_split") or 0):
+                has_q = self.store.conn.execute(
+                    "SELECT COUNT(*) n FROM records WHERE material_id=? AND quality<>''",
+                    (self.mid,)).fetchone()["n"]
+                if has_q:
+                    if not messagebox.askyesno(
+                            APP_TITLE,
+                            "这个材料已经有 %d 条带品质标记的记录。\n\n"
+                            "取消勾选后，新的记账不再分良品/不良品；\n"
+                            "已有的记录和数量统计都保留。\n\n确定要关掉吗？" % has_q,
+                            parent=self):
+                        return
+
         try:
             if self.mid:
                 self.store.update_material(
                     self.mid, name=name, spec=self.v_spec.get().strip(),
                     unit=self.v_unit.get().strip(), category=self.v_cat.get().strip(),
-                    min_qty=minq, note=self.v_note.get().strip())
+                    min_qty=minq, note=self.v_note.get().strip(),
+                    quality_split=qs)
             else:
                 self.store.add_material(
                     name, spec=self.v_spec.get().strip(), unit=self.v_unit.get().strip(),
                     category=self.v_cat.get().strip(), min_qty=minq,
-                    note=self.v_note.get().strip())
+                    note=self.v_note.get().strip(), quality_split=qs)
         except Exception as ex:
             messagebox.showerror(APP_TITLE, str(ex), parent=self)
             return
