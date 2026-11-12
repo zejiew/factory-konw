@@ -97,6 +97,38 @@ def now_full():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+# ------------------------------------------------------------------ 同步用的 uid
+#
+# 两类数据用两种 uid 策略，这个区别很关键：
+#
+#   材料 / 代工厂 —— 用「名称+规格」算确定性 UUID5。
+#     这样两台电脑各自建「不锈钢板 / 304」，算出来的 uid 相同，
+#     合并时会认成同一条，而不是变成两条一模一样的材料。
+#     代价：改名等于换身份（会被当成新材料）。这是可接受的取舍，
+#     因为材料名本来就该稳定，改名时两端也通常都会改。
+#
+#   流水 —— 用随机 UUID4。
+#     每笔账都是独立事件，哪怕时间和内容完全相同，也必须区分成两条。
+
+UID_NS = uuid.UUID("6f1c1e2a-33d4-5a7b-9c8e-0b1d2a3f4e5d")
+
+
+def material_uid(name, spec):
+    """材料 uid：由名称+规格确定性生成，跨设备一致。"""
+    key = "%s\x1f%s" % ((name or "").strip(), (spec or "").strip())
+    return str(uuid.uuid5(UID_NS, "material:" + key))
+
+
+def factory_uid(name):
+    """代工厂 uid：由名称确定性生成，跨设备一致。"""
+    return str(uuid.uuid5(UID_NS, "factory:" + (name or "").strip()))
+
+
+def new_record_uid():
+    """流水 uid：随机，每笔账独立。"""
+    return str(uuid.uuid4())
+
+
 def today_str():
     return datetime.date.today().strftime("%Y-%m-%d")
 
@@ -252,11 +284,20 @@ class Store(object):
 
             # 关键顺序：先把空 uid 全部补上，再建唯一索引。
             # 反过来会直接失败——所有老数据 uid 都是 ''，加唯一索引时互相冲突。
-            rows = c.execute("SELECT id FROM %s WHERE uid=''" % table).fetchall()
+            #
+            # 补 uid 的规则跟新建时保持一致：
+            #   材料 / 工厂 → 按名称(+规格)确定性生成，这样另一端建的同名项能对上
+            #   流水        → 老流水没有更合适的种子，用确定性 UUID5 保证同一条稳定
+            rows = c.execute("SELECT * FROM %s WHERE uid=''" % table).fetchall()
             for r in rows:
-                det = _uuid.uuid5(_uuid.NAMESPACE_URL, "invtool/%s/%s" % (table, r[0]))
+                if table == "materials":
+                    u = material_uid(r["name"], r["spec"])
+                elif table == "factories":
+                    u = factory_uid(r["name"])
+                else:
+                    u = str(uuid.uuid5(UID_NS, "legacy-record:%s:%s" % (table, r["id"])))
                 c.execute("UPDATE %s SET uid=?, updated_at=COALESCE(NULLIF(updated_at,''), ?)"
-                          " WHERE id=?" % table, (str(det), now_full(), r[0]))
+                          " WHERE id=?" % table, (u, now_full(), r["id"]))
             if rows:
                 c.commit()
 
@@ -275,6 +316,46 @@ class Store(object):
                 c.rollback()
                 c.execute("CREATE INDEX IF NOT EXISTS ix_%s_uid ON %s(uid)" % (table, table))
                 c.commit()
+
+        # ---------------- 把材料/工厂的 uid 统一成确定性值 ----------------
+        #
+        # 早期版本给材料/工厂用的是随机 uuid4，导致两台电脑各自建的同名材料
+        # 得到不同 uid，合并时会被当成两条不同材料。
+        # 这里把所有材料/工厂的 uid 重算成「名称+规格」派生的 UUID5，
+        # 让跨设备同名项能自动对上。
+        #
+        # 只改 materials / factories，不动 records：
+        # 流水是独立事件，uid 必须保持稳定，重算会让已同步的数据对不上。
+        self._normalize_entity_uids()
+
+    def _normalize_entity_uids(self):
+        """把材料/工厂 uid 收敛到确定性值。已经正确的不动，避免无谓写入。"""
+        c = self.conn
+        changed = 0
+
+        for r in c.execute("SELECT id, name, spec, uid FROM materials").fetchall():
+            want = material_uid(r["name"], r["spec"])
+            if r["uid"] != want:
+                # 目标 uid 可能已被另一条占着（改名后撞车），那就跳过这条
+                taken = c.execute("SELECT id FROM materials WHERE uid=? AND id<>?",
+                                  (want, r["id"])).fetchone()
+                if taken:
+                    continue
+                c.execute("UPDATE materials SET uid=? WHERE id=?", (want, r["id"]))
+                changed += 1
+
+        for r in c.execute("SELECT id, name, uid FROM factories").fetchall():
+            want = factory_uid(r["name"])
+            if r["uid"] != want:
+                taken = c.execute("SELECT id FROM factories WHERE uid=? AND id<>?",
+                                  (want, r["id"])).fetchone()
+                if taken:
+                    continue
+                c.execute("UPDATE factories SET uid=? WHERE id=?", (want, r["id"]))
+                changed += 1
+
+        if changed:
+            c.commit()
 
     # ---------------- 设置项
 
@@ -353,7 +434,7 @@ class Store(object):
             "INSERT INTO materials(name, spec, unit, category, min_qty, note, active,"
             " quality_split, uid, updated_at, created_at) VALUES(?,?,?,?,?,?,1,?,?,?,?)",
             (name, spec, unit or "", category or "", float(min_qty or 0), note or "",
-             1 if quality_split else 0, str(uuid.uuid4()), now_full(), now_str()),
+             1 if quality_split else 0, material_uid(name, spec), now_full(), now_str()),
         )
         self.conn.commit()
         self.mark_dirty("material_add", name)
@@ -436,7 +517,7 @@ class Store(object):
         cur = self.conn.execute(
             "INSERT INTO factories(name, contact, note, active, uid, updated_at, created_at)"
             " VALUES(?,?,?,1,?,?,?)",
-            (name, contact or "", note or "", str(uuid.uuid4()), now_full(), now_str()),
+            (name, contact or "", note or "", factory_uid(name), now_full(), now_str()),
         )
         self.conn.commit()
         self.mark_dirty("factory_add", name)
@@ -558,7 +639,7 @@ class Store(object):
             " VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?)",
             (ts, rtype, material_id, factory_id, delta, quality,
              batch or "", operator or "", note or "",
-             str(uuid.uuid4()), now_full(), now_str()),
+             new_record_uid(), now_full(), now_str()),
         )
         self.conn.commit()
         rid = self.conn.execute("SELECT last_insert_rowid() id").fetchone()["id"]

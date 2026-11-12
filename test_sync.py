@@ -118,16 +118,37 @@ eb.merge(ea.export_payload())
 row = B.conn.execute("SELECT voided FROM records WHERE uid=?", (rid_uid,)).fetchone()
 check(row["voided"] == 1, "B 端也变成已作废")
 
-# ============================================================ 场景5：同名材料不撞车
-print("\n[场景5：两端各建了同名材料]")
+# ============================================================ 场景5：同名材料自动合并
+print("\n[场景5：两端各建了同名材料，应认成同一条]")
 C, ec = new_device("C")
 D, ed = new_device("D")
-C.add_material("钢管", spec="DN50", unit="根")
-D.add_material("钢管", spec="DN50", unit="根")
-# 两边 uid 不同，但 name+spec 相同
+mc = C.add_material("钢管", spec="DN50", unit="根")
+md = D.add_material("钢管", spec="DN50", unit="根")
+
+# 材料的 uid 由「名称+规格」确定性生成，所以两端独立创建也得到同一个 uid
+check(C.material_by_id(mc)["uid"] == D.material_by_id(md)["uid"],
+      "两端独立创建的同名材料得到相同 uid")
+
+fc = C.add_factory("同一个厂")
+fd = D.add_factory("同一个厂")
+check(C.factory_by_id(fc)["uid"] == D.factory_by_id(fd)["uid"],
+      "两端独立创建的同名工厂得到相同 uid")
+
+# 各记一笔账，合并后应该是一条材料、两条流水
+C.add_record("IN", mc, fc, 100, batch="C-001")
+D.add_record("IN", md, fd, 200, batch="D-001")
+
 r = ed.merge(ec.export_payload())
-check(len(D.list_materials()) == 1, "同名同规格不会变成两条，仍为 1 条")
-check(r["materials"]["skip"] >= 1, "冲突的那条被记为 skip")
+check(len(D.list_materials()) == 1, "合并后仍只有 1 条钢管（实际 %d）" % len(D.list_materials()))
+check(r["materials"]["skip"] >= 1, "同名材料走 skip 而不是重复新增")
+check(len(D.list_records()) == 2, "两边的流水都保留，共 2 条（实际 %d）" % len(D.list_records()))
+tot = sum(x["total"] for x in D.stock_overview())
+check(abs(tot - 300) < 1e-6, "合并后结存 100 + 200 = 300（实际 %s）" % tot)
+
+# 名称不同则必须是两条
+mc2 = C.add_material("角钢", spec="DN50", unit="根")
+check(C.material_by_id(mc2)["uid"] != C.material_by_id(mc)["uid"],
+      "名称不同 → uid 不同，不会被误合并")
 
 # ============================================================ 场景6：增量同步
 print("\n[场景6：增量只带改动过的]")

@@ -421,14 +421,20 @@ class CloudBackup(object):
         return base, op
 
     def push_sync(self, payload_text, timeout=60):
-        """把同步包传上去（同名覆盖）。"""
+        """
+        把同步包传上去。
+
+        sameName=true 让服务端把同名文件写成「新版本」，云端始终只有一个同步包。
+        如果用 false，服务端会自动改名成 "xxx (2).json"，越传越多，
+        find_sync_file 就可能挑到旧的那份 —— 那样同步会静默用到过期数据。
+        """
         c = self.config()
         if not c["url"] or not c["password"]:
             return UploadResult(False, "没配置备份地址或密码")
         try:
             base, op = self._open_session(timeout)
             data = payload_text.encode("utf-8")
-            q = urllib.parse.urlencode({"name": self.SYNC_FILENAME, "sameName": "false"})
+            q = urllib.parse.urlencode({"name": self.SYNC_FILENAME, "sameName": "true"})
             req = urllib.request.Request(
                 base + "/api/files?" + q, data=data, method="POST",
                 headers={"content-type": "application/json; charset=utf-8",
@@ -441,7 +447,8 @@ class CloudBackup(object):
             res = (d.get("results") or [{}])[0]
             f = res.get("file") or {}
             return UploadResult(True, "同步包已上传（%d KB）" % max(1, len(data) // 1024),
-                                self.SYNC_FILENAME, f.get("id", ""), res.get("action", ""))
+                                f.get("name") or self.SYNC_FILENAME,
+                                f.get("id", ""), res.get("action", ""))
         except urllib.error.HTTPError as ex:
             return UploadResult(False, "服务器返回 HTTP %d" % ex.code)
         except urllib.error.URLError as ex:
@@ -451,11 +458,24 @@ class CloudBackup(object):
 
     def find_sync_file(self, timeout=25):
         """
-        在云端找同步包。可能有多份同名历史（服务端会保留旧版本），
-        取 updated 最新的那个。
+        在云端找同步包。
+
+        正常情况下云端只有一个「_同步包_请勿手动修改.json」。
+        但历史上用过 sameName=false，服务端会改名成 "xxx (2).json"，
+        所以这里同时认带序号后缀的同名文件，再按 updated 取最新的那个，
+        避免挑到过期的那一份。
         """
         files = self.list_remote(timeout=timeout)
-        cands = [f for f in files if f.get("name") == self.SYNC_FILENAME]
+        stem = self.SYNC_FILENAME[:-5] if self.SYNC_FILENAME.endswith(".json") else self.SYNC_FILENAME
+
+        def is_sync_pack(name):
+            n = name or ""
+            if n == self.SYNC_FILENAME:
+                return True
+            # 兼容 "名字 (2).json" 这类历史遗留
+            return n.startswith(stem + " (") and n.endswith(").json")
+
+        cands = [f for f in files if is_sync_pack(f.get("name"))]
         if not cands:
             return None
         cands.sort(key=lambda f: f.get("updated") or 0, reverse=True)
