@@ -752,11 +752,21 @@ class App(tk.Tk):
         e = ttk.Entry(r2, textvariable=self.v_f_kw, width=20)
         e.pack(side="left", padx=4)
         e.bind("<Return>", lambda _e: self.refresh_records())
-
         ttk.Button(r2, text="查询", command=self.refresh_records).pack(side="left", padx=(10, 4))
-        ttk.Button(r2, text="导出 CSV", command=self.export_records).pack(side="right", padx=4)
-        ttk.Button(r2, text="恢复选中", command=lambda: self.void_selected_records(False)).pack(side="right", padx=4)
-        ttk.Button(r2, text="作废选中", command=lambda: self.void_selected_records(True)).pack(side="right", padx=4)
+
+        # 操作按钮单独一行 —— 筛选那行塞不下这么多按钮，会被挤没
+        r3 = tk.Frame(bar, bg=C_CARD)
+        r3.pack(fill="x", padx=14, pady=(6, 2))
+        self.btn_rec_delete = ttk.Button(r3, text="删除选中", style="Danger.TButton",
+                                         command=self.delete_selected_records)
+        self.btn_rec_delete.pack(side="left")
+        ttk.Button(r3, text="回收站", command=self.open_recycle_bin).pack(side="left", padx=(8, 0))
+        tk.Label(r3, text="删除 = 从列表移除、可在回收站找回；作废 = 留在列表但不计入结存",
+                 bg=C_CARD, fg="#9aa4b1", font=(self.font_name, 8)).pack(side="left", padx=14)
+
+        ttk.Button(r3, text="导出 CSV", command=self.export_records).pack(side="right")
+        ttk.Button(r3, text="恢复选中", command=lambda: self.void_selected_records(False)).pack(side="right", padx=4)
+        ttk.Button(r3, text="作废选中", command=lambda: self.void_selected_records(True)).pack(side="right", padx=4)
 
         wrap = tk.Frame(root, bg=C_CARD, highlightbackground=C_LINE, highlightthickness=1)
         wrap.pack(fill="both", expand=True)
@@ -851,6 +861,46 @@ class App(tk.Tk):
         self.set_status("已%s %d 条" % (act, len(sel)), C_OUT if voided else C_IN)
         self.refresh_all()
         self.auto_cloud_after_save()
+
+    def delete_selected_records(self):
+        """
+        删除选中的流水（软删除，可在回收站恢复）。
+
+        与「作废」的区别要跟用户讲清楚，不然容易点错：
+          作废 = 账还在、留个痕，只是不算进结存
+          删除 = 从列表里拿走，去回收站找
+        """
+        sel = self.tv_rec.selection()
+        if not sel:
+            messagebox.showinfo(APP_TITLE, "先选中要删除的记录", parent=self)
+            return
+
+        rows = [self.store.record_by_id(int(i)) for i in sel]
+        rows = [r for r in rows if r]
+        sample = rows[:5]
+        detail = "\n".join(
+            "  %s  %s  %s%s" % (r["ts"], TYPE_LABELS.get(r["type"], r["type"]),
+                                "+" if r["delta"] > 0 else "", fmt_qty(r["delta"]))
+            for r in sample)
+        if len(rows) > 5:
+            detail += "\n  …还有 %d 条" % (len(rows) - 5)
+
+        msg = ("确定删除这 %d 条记录？\n\n%s\n\n"
+               "删除后这些记录不再计入结存，可以在「回收站」里恢复。\n\n"
+               "（如果只是想让这笔账失效、但要留在列表里，请用「作废选中」）"
+               % (len(sel), detail))
+
+        if not messagebox.askyesno(APP_TITLE, msg, parent=self):
+            return
+
+        n = self.store.delete_records([int(i) for i in sel])
+        self.set_status("已删除 %d 条记录（可在回收站恢复）" % n, C_OUT)
+        self.refresh_all()
+        self.auto_cloud_after_save()
+
+    def open_recycle_bin(self):
+        """打开回收站窗口。"""
+        RecycleBinDialog(self, self.store, on_done=self.refresh_all)
 
     def export_records(self):
         rows = self.store.list_records(**self._record_filters())
@@ -1813,6 +1863,136 @@ class FactoryDialog(tk.Toplevel):
             return
         if self.on_done:
             self.on_done()
+        self.destroy()
+
+
+# ==================================================================== 回收站
+
+class RecycleBinDialog(tk.Toplevel):
+    """
+    已删除的流水放在这里。可以「恢复」回列表，或「彻底删除」。
+
+    彻底删除不可逆，而且不会同步到其他设备 ——
+    本机删干净了，别的设备还留着，下次同步可能又带回来，所以界面上要讲清楚。
+    """
+
+    def __init__(self, master, store, on_done=None):
+        super().__init__(master)
+        self.store = store
+        self.on_done = on_done
+        self.f = master.font_name
+        self.title("回收站 —— 已删除的流水")
+        self.configure(bg=C_BG)
+        self.geometry("980x560")
+        self.minsize(760, 400)
+        self.transient(master)
+
+        top = tk.Frame(self, bg=C_CARD)
+        top.pack(fill="x")
+        tk.Label(top, text="回收站", font=(self.f, 13, "bold"), bg=C_CARD,
+                 fg=C_TEXT).pack(side="left", padx=16, pady=10)
+        self.lbl_count = tk.Label(top, text="", bg=C_CARD, fg=C_MUTED, font=(self.f, 9))
+        self.lbl_count.pack(side="left", padx=6)
+
+        tk.Frame(self, bg=C_LINE, height=1).pack(fill="x")
+
+        bar = tk.Frame(self, bg=C_BG)
+        bar.pack(fill="x", padx=12, pady=8)
+        ttk.Button(bar, text="恢复选中", command=self.do_restore).pack(side="left")
+        ttk.Button(bar, text="彻底删除选中", command=self.do_purge).pack(side="left", padx=8)
+        ttk.Button(bar, text="清空回收站", command=self.do_purge_all).pack(side="left")
+        ttk.Button(bar, text="刷新", command=self.reload).pack(side="right")
+        tk.Label(bar, text="彻底删除后无法恢复；本机删掉不会影响其他设备",
+                 bg=C_BG, fg=C_MUTED, font=(self.f, 8)).pack(side="right", padx=10)
+
+        wrap = tk.Frame(self, bg=C_CARD, highlightbackground=C_LINE, highlightthickness=1)
+        wrap.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        cols = ("ts", "type", "mat", "quality", "fac", "qty", "unit", "batch", "note")
+        self.tv = ttk.Treeview(wrap, columns=cols, show="headings", height=16)
+        for c, t, w, a, stretch in (
+                ("ts", "时间", 150, "center", False), ("type", "类型", 56, "center", False),
+                ("mat", "材料", 160, "w", True), ("quality", "品质", 60, "center", False),
+                ("fac", "代工厂", 140, "w", True), ("qty", "数量", 84, "e", False),
+                ("unit", "单位", 52, "center", False), ("batch", "批次/单号", 120, "w", False),
+                ("note", "备注", 180, "w", True)):
+            self.tv.heading(c, text=t, anchor=a)
+            self.tv.column(c, width=w, anchor=a, stretch=stretch)
+        vs = ttk.Scrollbar(wrap, orient="vertical", command=self.tv.yview)
+        self.tv.configure(yscrollcommand=vs.set)
+        self.tv.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        self.tv.tag_configure("odd", background="#fafbfd")
+
+        self.bind("<Escape>", lambda _e: self.close())
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.reload()
+
+    def reload(self):
+        tv = self.tv
+        tv.delete(*tv.get_children())
+        rows = self.store.list_records(only_deleted=True, include_voided=True, limit=5000)
+        for i, r in enumerate(rows):
+            unit = r["unit"] or ""
+            sign = "+" if r["delta"] > 0 else ""
+            tv.insert("", "end", iid=str(r["id"]),
+                      values=(r["ts"], TYPE_LABELS.get(r["type"], r["type"]),
+                              r["material_name"] + (" " + r["material_spec"]
+                                                    if r["material_spec"] else ""),
+                              QUALITY_LABELS.get(r.get("quality") or "", ""),
+                              r["factory_name"],
+                              sign + fmt_qty(r["delta"]), unit, r["batch"], r["note"]),
+                      tags=("odd",) if i % 2 else ())
+        self.lbl_count.config(text="共 %d 条" % len(rows))
+
+    def _sel_ids(self):
+        return [int(i) for i in self.tv.selection()]
+
+    def _done(self, msg, n):
+        self.reload()
+        if self.on_done:
+            self.on_done()
+        if n:
+            self.lbl_count.config(text="%s —— 现有 %d 条"
+                                  % (msg, len(self.tv.get_children())))
+
+    def do_restore(self):
+        ids = self._sel_ids()
+        if not ids:
+            messagebox.showinfo(APP_TITLE, "先选中要恢复的记录", parent=self)
+            return
+        n = self.store.restore_records(ids)
+        self._done("已恢复 %d 条" % n, n)
+
+    def do_purge(self):
+        ids = self._sel_ids()
+        if not ids:
+            messagebox.showinfo(APP_TITLE, "先选中要彻底删除的记录", parent=self)
+            return
+        if not messagebox.askyesno(
+                APP_TITLE,
+                "彻底删除这 %d 条？\n\n删掉之后无法恢复。\n\n"
+                "另外：如果开了多端同步，其他设备上的这些记录仍在，"
+                "下次同步可能会把它们再带回来。" % len(ids), parent=self):
+            return
+        n = self.store.purge_records(ids)
+        self._done("已彻底删除 %d 条" % n, n)
+
+    def do_purge_all(self):
+        ids = [int(i) for i in self.tv.get_children()]
+        if not ids:
+            messagebox.showinfo(APP_TITLE, "回收站是空的", parent=self)
+            return
+        if not messagebox.askyesno(
+                APP_TITLE,
+                "清空回收站？共 %d 条，删除后无法恢复。\n\n"
+                "注意：其他设备上如果还有这些记录，同步时可能会带回来。" % len(ids),
+                parent=self):
+            return
+        n = self.store.purge_records(ids)
+        self._done("已清空 %d 条" % n, n)
+
+    def close(self):
         self.destroy()
 
 

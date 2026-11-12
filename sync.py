@@ -41,10 +41,53 @@ def now_str():
 
 
 def _ts_key(s):
-    """把时间字符串转成可比较的值。空值当作最旧。"""
+    """
+    把时间字符串转成可比较的值。空值当作最旧。
+
+    历史数据是「2026-11-12 12:00:00」，新数据是「2026-11-12 12:00:00.123」。
+    直接按字符串比较会出错：'12:00:00' < '12:00:00.123' 是对的，
+    但如果两边一个是带毫秒一个不带，判断「谁更新」就容易出偏差。
+    这里统一补齐到毫秒再比。
+    """
     if not s:
         return ""
-    return str(s)
+    t = str(s).strip()
+    if not t:
+        return ""
+    # 只有日期，补成当天零点
+    if len(t) == 10:
+        return t + " 00:00:00.000"
+    # 到分钟，补秒和毫秒
+    if len(t) == 16:
+        return t + ":00.000"
+    # 到秒，补毫秒
+    if len(t) == 19:
+        return t + ".000"
+    # 毫秒位数不足三位时补齐
+    if "." in t:
+        head, _, frac = t.partition(".")
+        frac = (frac + "000")[:3]
+        return head + "." + frac
+    return t
+
+
+def _remote_wins(remote_ts, local_ts, remote_deleted, local_deleted):
+    """
+    判断远端这条是否该覆盖本地。
+
+    规则：
+      1. 远端时间戳更新 → 用远端
+      2. 时间戳相同，但远端「已删除」而本地没有 → 用远端
+         （删除优先：宁可接受一次删除，也不要让删掉的记录反复活过来）
+      3. 否则保留本地
+    """
+    rt = _ts_key(remote_ts)
+    lt = _ts_key(local_ts)
+    if rt > lt:
+        return True
+    if rt == lt and int(remote_deleted or 0) == 1 and int(local_deleted or 0) == 0:
+        return True
+    return False
 
 
 class SyncEngine(object):
@@ -269,8 +312,8 @@ class SyncEngine(object):
             counter["add"] += 1
             return
 
-        lt = _ts_key(cur["updated_at"])
-        if remote_ts <= lt:
+        if not _remote_wins(remote_ts, cur["updated_at"],
+                            it.get("deleted"), cur["deleted"]):
             counter["skip"] += 1
             uid_to_id[uid] = cur["id"]
             return
@@ -317,8 +360,8 @@ class SyncEngine(object):
             counter["add"] += 1
             return
 
-        lt = _ts_key(cur["updated_at"])
-        if remote_ts <= lt:
+        if not _remote_wins(remote_ts, cur["updated_at"],
+                            it.get("deleted"), cur["deleted"]):
             counter["skip"] += 1
             uid_to_id[uid] = cur["id"]
             return
@@ -364,8 +407,8 @@ class SyncEngine(object):
             counter["add"] += 1
             return
 
-        lt = _ts_key(cur["updated_at"])
-        if remote_ts <= lt:
+        if not _remote_wins(remote_ts, cur["updated_at"],
+                            it.get("deleted"), cur["deleted"]):
             counter["skip"] += 1
             return
 

@@ -48,6 +48,28 @@ COMMON_UNITS = ["个", "件", "套", "千克", "克", "吨", "米", "平方米",
 EPS = 1e-9
 
 
+def _clean_ids(rids):
+    """
+    把各种形态的 id 输入整理成干净的 int 列表。
+
+    要容忍 None、空串、字符串数字、非数字垃圾 —— 这些都可能从
+    界面选择或同步数据里冒出来，不该让整个操作崩掉。
+    """
+    out = []
+    for r in (rids or []):
+        if r is None:
+            continue
+        if isinstance(r, bool):
+            continue
+        try:
+            v = int(r)
+        except (TypeError, ValueError):
+            continue
+        if v > 0:
+            out.append(v)
+    return out
+
+
 def _locked(fn):
     """
     给 Store 的公开方法自动加锁。
@@ -88,13 +110,16 @@ def now_str():
 
 def now_full():
     """
-    带秒的时间戳，专供 updated_at 用。
+    带毫秒的时间戳，专供 updated_at 用。
 
     为什么不能复用 now_str：它只到分钟。同一分钟内连记两笔账，
     updated_at 会完全相同，增量同步用 ">" 比较时就会把旧的一起带上，
     多端合并时也判断不出「谁后改的」。
+
+    为什么精确到毫秒：只到秒时，同一秒内的「记一笔 → 删除」会拿到相同的
+    updated_at，另一端同步时判不出谁更新，删除就传不过去。
     """
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
 # ------------------------------------------------------------------ 同步用的 uid
@@ -404,7 +429,8 @@ class Store(object):
     @_locked
     def material_total(self, material_id):
         row = self.conn.execute(
-            "SELECT COALESCE(SUM(delta),0) q FROM records WHERE material_id=? AND voided=0",
+            "SELECT COALESCE(SUM(delta),0) q FROM records"
+            " WHERE material_id=? AND voided=0 AND deleted=0",
             (material_id,),
         ).fetchone()
         return float(row["q"]) if row else 0.0
@@ -496,7 +522,8 @@ class Store(object):
     @_locked
     def factory_total(self, fid):
         row = self.conn.execute(
-            "SELECT COALESCE(SUM(delta),0) q FROM records WHERE factory_id=? AND voided=0", (fid,)
+            "SELECT COALESCE(SUM(delta),0) q FROM records"
+            " WHERE factory_id=? AND voided=0 AND deleted=0", (fid,)
         ).fetchone()
         return float(row["q"]) if row else 0.0
 
@@ -565,7 +592,7 @@ class Store(object):
         传 "good" / "defect" 只算该品质的结存。
         """
         sql = ("SELECT COALESCE(SUM(delta),0) q FROM records"
-               " WHERE material_id=? AND factory_id=? AND voided=0")
+               " WHERE material_id=? AND factory_id=? AND voided=0 AND deleted=0")
         args = [material_id, factory_id]
         if quality is not None:
             sql += " AND quality=?"
@@ -578,7 +605,8 @@ class Store(object):
         """返回 (良品, 不良品, 总数)。没开品质选项的材料，全部算良品口径之外的总数。"""
         rows = self.conn.execute(
             "SELECT quality, COALESCE(SUM(delta),0) q FROM records"
-            " WHERE material_id=? AND factory_id=? AND voided=0 GROUP BY quality",
+            " WHERE material_id=? AND factory_id=? AND voided=0 AND deleted=0"
+            " GROUP BY quality",
             (material_id, factory_id),
         ).fetchall()
         good = defect = other = 0.0
@@ -653,9 +681,86 @@ class Store(object):
         self.conn.commit()
         self.mark_dirty("void_record", "记录 #%d %s" % (rid, "作废" if voided else "恢复"))
 
+    # ---------------- 删除（软删除，可恢复）----------------
+    #
+    # 与「作废」的区别：
+    #   作废 voided=1  → 账还在列表里，只是不算进结存（用于「这笔记错了但想留痕」）
+    #   删除 deleted=1 → 从列表里彻底消失（回收站可见），可恢复
+    #
+    # 为什么不做真 DELETE：
+    #   多端同步靠 uid 识别同一条数据。真删掉的话，另一端同步时不知道它被删了，
+    #   会把它当成新数据又导回来，形成「删不掉的幽灵记录」。
+    #   所以打标记，同步时把 deleted=1 一起传过去。
+
+    @_locked
+    def delete_records(self, rids):
+        """批量软删除。返回实际删除的条数。"""
+        rids = _clean_ids(rids)
+        if not rids:
+            return 0
+        ts = now_full()
+        n = 0
+        for rid in rids:
+            cur = self.conn.execute(
+                "UPDATE records SET deleted=1, updated_at=? WHERE id=? AND deleted=0",
+                (ts, rid))
+            n += cur.rowcount or 0
+        self.conn.commit()
+        if n:
+            self.mark_dirty("delete_records", "%d 条" % n)
+        return n
+
+    @_locked
+    def restore_records(self, rids):
+        """从回收站恢复。返回实际恢复的条数。"""
+        rids = _clean_ids(rids)
+        if not rids:
+            return 0
+        ts = now_full()
+        n = 0
+        for rid in rids:
+            cur = self.conn.execute(
+                "UPDATE records SET deleted=0, updated_at=? WHERE id=? AND deleted=1",
+                (ts, rid))
+            n += cur.rowcount or 0
+        self.conn.commit()
+        if n:
+            self.mark_dirty("restore_records", "%d 条" % n)
+        return n
+
+    @_locked
+    def purge_records(self, rids):
+        """
+        彻底删除（不可恢复）。只允许删已经在回收站里的，防止误删。
+        这种删除不会同步到其他设备——本机没了，别的设备还留着，
+        下次同步可能把它带回来。所以界面上要明确提示。
+        """
+        rids = _clean_ids(rids)
+        if not rids:
+            return 0
+        n = 0
+        for rid in rids:
+            cur = self.conn.execute("DELETE FROM records WHERE id=? AND deleted=1", (rid,))
+            n += cur.rowcount or 0
+        self.conn.commit()
+        if n:
+            self.mark_dirty("purge_records", "%d 条" % n)
+        return n
+
+    @_locked
+    def deleted_record_count(self):
+        row = self.conn.execute(
+            "SELECT COUNT(*) n FROM records WHERE deleted=1").fetchone()
+        return row["n"] if row else 0
+
     @_locked
     def list_records(self, date_from="", date_to="", rtype="", material_id=None,
-                     factory_id=None, keyword="", include_voided=True, limit=5000):
+                     factory_id=None, keyword="", include_voided=True, limit=5000,
+                     only_deleted=False):
+        """
+        include_deleted=False（默认）时不含已删除记录。
+        only_deleted=True 专供回收站用，只列已删除的。
+        """
         sql = """
             SELECT r.*, m.name AS material_name, m.spec AS material_spec, m.unit AS unit,
                    f.name AS factory_name
@@ -682,6 +787,11 @@ class Store(object):
             args.append(factory_id)
         if not include_voided:
             sql += " AND r.voided = 0"
+        # 回收站只看已删除的；正常列表一律排除已删除
+        if only_deleted:
+            sql += " AND r.deleted = 1"
+        else:
+            sql += " AND r.deleted = 0"
         if keyword:
             k = "%%%s%%" % keyword
             sql += " AND (m.name LIKE ? OR f.name LIKE ? OR r.batch LIKE ? OR r.note LIKE ? OR r.operator LIKE ?)"
@@ -703,7 +813,7 @@ class Store(object):
         for m in self.list_materials(keyword=keyword, active_only=True):
             rows = self.conn.execute(
                 "SELECT factory_id, quality, SUM(delta) qty, MAX(ts) last_ts"
-                " FROM records WHERE material_id=? AND voided=0"
+                " FROM records WHERE material_id=? AND voided=0 AND deleted=0"
                 " GROUP BY factory_id, quality",
                 (m["id"],),
             ).fetchall()
@@ -749,9 +859,10 @@ class Store(object):
     def stats(self):
         mats = self.conn.execute("SELECT COUNT(*) n FROM materials WHERE active=1").fetchone()["n"]
         facs = self.conn.execute("SELECT COUNT(*) n FROM factories WHERE active=1").fetchone()["n"]
-        recs = self.conn.execute("SELECT COUNT(*) n FROM records WHERE voided=0").fetchone()["n"]
+        recs = self.conn.execute(
+            "SELECT COUNT(*) n FROM records WHERE voided=0 AND deleted=0").fetchone()["n"]
         kinds = self.conn.execute(
-            "SELECT COUNT(*) n FROM (SELECT material_id FROM records WHERE voided=0"
+            "SELECT COUNT(*) n FROM (SELECT material_id FROM records WHERE voided=0 AND deleted=0"
             " AND delta>0 GROUP BY material_id)"
         ).fetchone()["n"]
         return {"materials": mats, "factories": facs, "records": recs, "with_stock": kinds}
